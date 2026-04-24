@@ -1,0 +1,17 @@
+[Unit]
+Description=AMS API
+After=network.target postgresql.service
+
+[Service]
+WorkingDirectory=/var/www/ams-api
+ExecStart=/usr/bin/dotnet /var/www/ams-api/AMS.Api.dll
+Restart=always
+RestartSec=10
+SyslogIdentifier=ams-api
+User=ubuntu
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://localhost:5000
+EnvironmentFile=/etc/ams/api.env
+
+[Install]
+WantedBy=multi-user.target
