@@ -1,0 +1,13 @@
+[Unit]
+Description=AMS PostgreSQL nightly logical backup
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+ExecStart=/usr/local/bin/pg-backup.sh
+# Tolerate transient failures without spamming alerts; the dead-man's-switch
+# in the script is the real "did it run" signal.
+Nice=10
+IOSchedulingClass=idle

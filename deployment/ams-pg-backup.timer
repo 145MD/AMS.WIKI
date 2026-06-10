@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AMS PostgreSQL backup nightly
+
+[Timer]
+# 02:30 local time, with jitter so it never collides with other cron-style jobs.
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target
