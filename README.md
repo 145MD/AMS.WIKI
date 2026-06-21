@@ -38,6 +38,7 @@ The Attendance Management System (AMS) is a comprehensive solution designed to m
 - [Attendance Module](./modules/attendance-module.md)
 - [Fee Management](./modules/fee-management.md)
 - [Notification Service](./modules/notification-service.md)
+- [Instructor Portal](./modules/instructor-portal.md)
 
 ### User Guides
 - [Student Guide](./guides/student-guide.md)
