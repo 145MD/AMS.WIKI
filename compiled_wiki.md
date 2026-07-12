@@ -38,6 +38,7 @@ The Attendance Management System (AMS) is a comprehensive solution designed to m
 - [Attendance Module](./modules/attendance-module.md)
 - [Fee Management](./modules/fee-management.md)
 - [Notification Service](./modules/notification-service.md)
+- [Instructor Portal](./modules/instructor-portal.md)
 
 ### User Guides
 - [Student Guide](./guides/student-guide.md)
@@ -2035,6 +2036,1168 @@ graph TB
 
 <div style="page-break-after: always;"></div>
 
+# Cross-Institute Identity — Frontend Implementation Plan
+
+**Status:** Approved design, ready to implement
+**Companion to:** [`cross-institute-identity.md`](./cross-institute-identity.md) (backend)
+**Target implementer:** Claude Sonnet (or any frontend engineer)
+**Last updated:** 2026-05-02
+
+> Read the backend plan first. This document only covers UI changes; the *why* lives in the backend doc.
+
+---
+
+## 1. Goal
+
+Make the AMS.PWA reflect the new global-identity model:
+
+1. Registrars collect the data the matcher needs (`FirstName`, `LastName`, `DateOfBirth`, `Gender`, optional `Nic`, optional `PersonCode`, structured `Guardian`).
+2. **Never display PII from other institutes.** Even if a returning student is linked behind the scenes, the institute UI shows only this institute's enrollment.
+3. Optional `PersonCode` input gives parents a clean way to assert "this is the same student" across institutes without revealing where they came from.
+4. New screens for the `GlobalIdentityAdmin` role: review queue, merge, split. Strictly isolated from the institute-scoped UI.
+5. Same flow applies to instructor onboarding.
+
+## 2. Non-Goals
+
+- No frontend matching logic. The matcher runs on the backend; the PWA never scores duplicates.
+- No "potential duplicate from another institute" UI for institute users. Ever.
+- No i18n in this iteration (the codebase has no i18n today).
+- No NFC hardware integration changes (existing text-input flow unchanged).
+
+---
+
+## 3. Current State (verified 2026-05-02)
+
+### 3.1 Stack
+- React 19.2.3, Vite 7.3.0, TypeScript 5.9.3
+- TanStack Router (file-based, `routeTree.gen.ts`)
+- Zustand for auth state (`src/stores/auth-store.ts`)
+- TanStack React Query + Axios (`src/lib/api-client.ts`)
+- React Hook Form + Zod
+- Radix + shadcn/ui + Tailwind v4
+- No i18n. Strings are inline.
+
+### 3.2 Folder layout
+- `src/routes/(auth)/` — public routes
+- `src/routes/_authenticated/` — institute-scoped, JWT-gated
+- `src/routes/(errors)/` — 401/403/404/500/503
+- `src/features/<domain>/` — feature modules with `components/`, `index.tsx`, etc.
+- `src/services/<domain>.service.ts` — Axios-based API clients
+- `src/hooks/use-<domain>.ts` — React Query wrappers
+- `src/types/<domain>.ts` — TS types
+- `src/components/permission-guard.tsx` — `<PermissionGuard permission="..." />`
+
+### 3.3 Existing student/instructor surface
+- `src/features/students/components/student-form.tsx` — Zod schema fields: `email, studentCode, dateOfBirth, guardianName, guardianPhone, guardianEmail, address, enrollmentNumber, notes`. **All free-text guardian.**
+- `src/services/student.service.ts` exposes `lookupIdentity({ email?, phone? })` returning `{ exists, userId? }`. **This is a PII leak risk** — see §5.6.
+- `src/types/student.ts` mirrors backend DTOs.
+- `src/features/users/` — global user management (admin-only).
+- `src/features/cards/` — NFC card issuance, validation, listing. Card UID accepted as text input.
+- No instructor enrollment form yet (verify; if absent it's added in this plan).
+- No identity-matching, merge, or duplicate UI of any kind.
+
+### 3.4 Auth & tenancy
+- `useAuthStore` holds `user, accessToken, refreshToken, instituteId, roles, permissions`.
+- `instituteId` is decoded from JWT (`institute_id` claim) and persisted.
+- API client auto-injects `Authorization: Bearer …` and `X-Institute-Id`.
+- UI gating via `<PermissionGuard permission="users:create">` etc.
+
+---
+
+## 4. Frontend Principles
+
+These are non-negotiable.
+
+1. **PII isolation in the response handler.** When a backend response indicates a link happened (or is pending), the PWA must NOT render any field originating from another institute. The student's view is always institute-local.
+2. **Registration is non-blocking.** The registrar sees an immediate success. No spinner that waits for the matcher.
+3. **`PersonCode` is the only cross-institute signal exposed to institute users.** It can be typed in (registration), displayed back (enrollment detail, NFC card), and printed (receipt, ID card). It never reveals which other institute issued it.
+4. **Global identity admin UI is strictly separated** from institute UI. Different route group, different role, different navigation entry, different layout.
+5. **Matching never happens client-side.** Don't ship trigram or phonetic logic to the browser. The frontend collects data and shows results from the backend.
+6. **Forms validate format, not uniqueness.** Uniqueness is a backend concern. The PWA only enforces local rules (e.g., `PersonCode` regex, phone format hints).
+
+---
+
+## 5. UI Changes by Surface
+
+### 5.1 Student registration form
+
+**File:** `src/features/students/components/student-form.tsx`
+
+Replace the current Zod schema. New shape:
+
+```ts
+const enrollSchema = z.object({
+  // identity (sent to global ApplicationUser)
+  firstName: z.string().min(1, 'First name is required.').max(100),
+  lastName: z.string().min(1, 'Last name is required.').max(200),
+  dateOfBirth: z.string().min(1, 'Date of birth is required for matching.'),
+  gender: z.enum(['Male', 'Female', 'Other', 'PreferNotToSay']).optional(),
+  nic: z.string().trim().optional(),                       // NEVER required
+  personCode: z
+    .string()
+    .regex(/^P-\d{4}-\d{6}$/, 'Format: P-YYYY-NNNNNN')
+    .optional(),                                            // optional re-enrollment shortcut
+  email: z.string().email().optional().or(z.literal('')),  // optional for minors
+
+  // institute-scoped
+  studentCode: z.string().min(1),
+  enrollmentNumber: z.string().optional(),
+  address: z.string().optional(),
+  notes: z.string().optional(),
+
+  // guardians (structured — see GuardianPicker §6.3)
+  guardians: z
+    .array(
+      z.object({
+        guardianId: z.string().uuid().optional(),         // null = new guardian
+        phoneNumber: z.string().min(1, 'Phone is required'),
+        name: z.string().optional(),
+        email: z.string().email().optional().or(z.literal('')),
+        relationship: z.enum(['Father', 'Mother', 'Guardian', 'Sibling', 'Self', 'Other']),
+        isPrimary: z.boolean(),
+      })
+    )
+    .min(1, 'At least one guardian is required.'),
+})
+```
+
+**Removed fields (do not collect):** `birthCertificateNumber` — not requested anywhere in the UI per project decision. The backend column exists but is opt-in for institutes that already collect it; out of scope for the PWA.
+
+**DOB:** Required for the matcher to work. If genuinely unknown, registrar uses a "DOB unknown" toggle which submits `null` and triggers a banner explaining matcher will not auto-link without DOB. Bias the design toward collecting it.
+
+**`PersonCode` field:**
+- Optional, placed under a collapsed "Have you enrolled before? Enter your student ID" disclosure on the form.
+- When entered AND format-valid, the form calls `useResolvePersonCode()` (see §7.4) and shows a green check (✓ "Existing record found") or a red ✗ ("ID not recognized — leave blank").
+- The check returns ONLY a boolean; no PII (no name, no DOB, no other institute). This is enforced by the backend endpoint contract.
+- Once validated, the form submits `personCode` and skips the matcher entirely on the backend.
+
+**Submission response handling:**
+- `POST /students` returns `{ enrollment, isLinkPending: boolean, personCode: string }`.
+- The PWA renders enrollment details and a small status pill: **"Identity verification queued"** if `isLinkPending`, else **"Verified"**. No mention of any other institute.
+- On the student detail page, the pill auto-refreshes every 5s for up to 60s while `isLinkPending`, then stops. (Use React Query `refetchInterval` with `enabled: isLinkPending`.)
+
+### 5.2 Student detail page
+
+**File:** `src/features/students/components/student-detail.tsx`
+
+Add to the header:
+- `<PersonCodeBadge code={student.personCode} />` — copy-to-clipboard, optional QR icon that opens a dialog showing a printable QR (encodes only the `PersonCode` string).
+- `<IdentityVerificationPill state={isLinkPending ? 'pending' : 'verified'} />`.
+
+Add a "Guardians" card listing structured guardians:
+- Phone (formatted), name, relationship, primary badge.
+- "Add guardian" button → opens `GuardianPicker`.
+- Optional "Siblings at this institute" sub-list — same `Guardian.id` linked to other students in the **current institute only**. Backend filters by `CurrentInstituteId`. Cross-institute siblings are intentionally hidden.
+
+### 5.3 Instructor enrollment form
+
+**File:** `src/features/instructors/components/instructor-form.tsx` (create if missing)
+
+Same identity fields as student (`firstName, lastName, dateOfBirth, gender, nic?, email?, personCode?`) plus instructor-specific (`designation, qualification, bio, joinDate, role, isActive`). Drop redundant `name`, `contactEmail`, `contactPhone` (they belong on `ApplicationUser`).
+
+Guardian section is replaced with **"Contact"** (a `Self`-relationship guardian by default; one phone, one email).
+
+### 5.4 NFC card UI
+
+**File:** `src/features/cards/components/card-detail.tsx`
+
+- Display the linked student's `personCode` next to their name. Provide a "Print card" action that includes `personCode` as a small QR + human-readable text.
+- No backend change to NFC logic; cards remain scoped to enrollments.
+
+### 5.5 PWA card-checking flow
+
+No identity changes. Validation endpoint already returns `{ isValid, studentEnrollmentId, instituteId, cardStatus }`. The auto-merge re-points the enrollment FK transparently, so a returning student's card-check at the new institute Just Works.
+
+### 5.6 Lock down the existing `lookupIdentity` flow
+
+**Risk:** `student.service.ts → lookupIdentity({ email, phone })` currently returns `{ exists, userId }`. This leaks cross-institute existence to a registrar who guesses an email or phone.
+
+**Fix:**
+1. Remove `lookupIdentity` from the registrar's flow entirely. The matcher handles linking now.
+2. Replace it with `resolvePersonCode({ personCode })` returning ONLY `{ valid: boolean }`. Used solely to validate the optional `personCode` field on the registration form. Backend endpoint must enforce: no name, no email, no other institute, no DOB in the response.
+3. If a `lookupIdentity` consumer remains for any global-admin tool, gate it behind the global-admin policy — never expose to institute roles.
+
+Update `src/services/student.service.ts` and `src/hooks/use-students.ts` accordingly.
+
+---
+
+## 6. New Components
+
+### 6.1 `<PersonCodeBadge code={...} />`
+**File:** `src/components/person-code-badge.tsx`
+
+- Pill with monospaced text `P-2026-000123`.
+- Click → copy to clipboard + toast.
+- Optional QR icon button → modal showing QR (use `qrcode.react` — small dep) and a "Print" button that opens a print-friendly view via `window.print()`.
+
+### 6.2 `<IdentityVerificationPill state="pending|verified" />`
+**File:** `src/components/identity-verification-pill.tsx`
+
+- Tooltip on hover explaining "Identity verification runs in the background to detect prior enrollment. No data is shared between institutes." Be deliberate about the wording — it must reassure without revealing anything.
+
+### 6.3 `<GuardianPicker value={guardians} onChange={...} />`
+**File:** `src/features/guardians/components/guardian-picker.tsx`
+
+Multi-guardian editor. For each guardian row:
+1. Phone input (formats as user types using `libphonenumber-js` — already light dep). On blur, the picker calls `useGuardianLookupByPhone(normalizedPhone)`:
+   - If found in the **current institute scope**, prefill `guardianId, name, email`. Show "Existing guardian linked".
+   - If not found, leave fields editable and submit creates a new `Guardian`.
+2. Name (text), email (optional), relationship (select), primary toggle.
+3. Add/remove rows. At least one row required, exactly one `isPrimary = true`.
+
+The guardian lookup is **institute-scoped**. Guardians are not auto-shared across institutes through this picker; a new institute creates its own `Guardian` row even if the phone matches another institute. Only the matcher (server-side) considers cross-institute guardians, never the UI.
+
+### 6.4 `<GenderSelect />`
+**File:** `src/components/gender-select.tsx`
+
+Wraps shadcn `Select`. Values match backend enum exactly: `Male | Female | Other | PreferNotToSay`.
+
+### 6.5 `<NicInput />`
+**File:** `src/components/nic-input.tsx`
+
+Optional text input with a small format hint. No regional validation hardcoded — accept any non-empty trimmed string. Validation is server-side. Always optional in this app.
+
+### 6.6 `<DobUnknownToggle />`
+**File:** `src/features/students/components/dob-unknown-toggle.tsx`
+
+Checkbox below DOB field: "Date of birth unavailable". When checked:
+- Disables DOB input, sets value to `null`.
+- Renders a yellow inline note: *"Without a date of birth, this student cannot be auto-linked to prior enrollments. Add it later when known."*
+- This is the one place we actively educate the registrar on why DOB matters — without leaking PII.
+
+---
+
+## 7. Services & Hooks
+
+### 7.1 New service: `guardian.service.ts`
+**File:** `src/services/guardian.service.ts`
+
+```ts
+export const guardianService = {
+  searchByPhone: (phone: string) => api.get<ApiResponse<Guardian | null>>('/guardians/lookup', { params: { phone } }),
+  list: (params) => api.get<ApiResponse<PaginatedResponse<Guardian>>>('/guardians', { params }),
+  create: (data: CreateGuardianRequest) => api.post<ApiResponse<Guardian>>('/guardians', data),
+  link: (data: { userId: number; guardianId: string; relationship: GuardianRelationship; isPrimary: boolean }) =>
+    api.post<ApiResponse<UserGuardian>>('/user-guardians', data),
+  unlink: (id: string) => api.delete<ApiResponse<void>>(`/user-guardians/${id}`),
+}
+```
+
+### 7.2 New service: `global-identity.service.ts`
+**File:** `src/services/global-identity.service.ts`
+
+Used only by the global-admin UI.
+
+```ts
+export const globalIdentityService = {
+  listReview: (params) => api.get<ApiResponse<PaginatedResponse<IdentityReviewItem>>>('/global-identity/review', { params }),
+  resolveReview: (id: string, body: ResolveReviewItemRequest) =>
+    api.post<ApiResponse<void>>(`/global-identity/review/${id}/resolve`, body),
+  merge: (body: MergePersonsRequest) => api.post<ApiResponse<void>>('/global-identity/merge', body),
+  split: (body: SplitPersonRequest) => api.post<ApiResponse<void>>('/global-identity/split', body),
+  getMergeAuditTrail: (userId: number) => api.get<ApiResponse<PersonMergeAudit[]>>(`/global-identity/users/${userId}/merge-audit`),
+}
+```
+
+This service must include a header `X-Bypass-Institute-Scope: true` (or rely on the policy on the backend). Document the contract — backend enforces it regardless.
+
+### 7.3 Update `student.service.ts`
+
+- Remove `lookupIdentity`. Add `resolvePersonCode(code: string): Promise<{ valid: boolean }>` (or move to a new `identity.service.ts`).
+- `enrollStudent(data: EnrollStudentRequest)` — drop `email`-required, drop free-text `guardianName/Phone/Email`, add structured `guardians[]`, add `gender`, `nic`, `personCode` fields.
+- Response type extended with `personCode: string` and `isLinkPending: boolean`.
+
+### 7.4 New hooks
+**Files:** `src/hooks/use-guardians.ts`, `src/hooks/use-global-identity.ts`, `src/hooks/use-resolve-person-code.ts`
+
+Standard React Query wrappers. `useResolvePersonCode` uses a debounced fetch (300ms) keyed by the input value, with `enabled: regex.test(value)`.
+
+### 7.5 Types
+
+**Files:** `src/types/guardian.ts`, `src/types/identity.ts`
+
+```ts
+// guardian.ts
+export type GuardianRelationship = 'Father' | 'Mother' | 'Guardian' | 'Sibling' | 'Self' | 'Other'
+export interface Guardian { id: string; phoneNumber: string; name?: string; email?: string; nic?: string }
+export interface UserGuardian { id: string; userId: number; guardianId: string; relationship: GuardianRelationship; isPrimary: boolean }
+
+// identity.ts
+export type Gender = 'Male' | 'Female' | 'Other' | 'PreferNotToSay'
+export type ReviewStatus = 'Pending' | 'Resolved' | 'Dismissed'
+export type ReviewReason = 'TwinClusterDetected' | 'ScoreInReviewBand' | 'GenderConflict' | 'Other'
+export type ResolvedAction = 'Linked' | 'NewPerson' | 'NeedsMoreInfo'
+
+export interface IdentityReviewItem {
+  id: string
+  provisionalUserId: number
+  candidateUserId?: number
+  score: number
+  reason: ReviewReason
+  candidates: Array<{ userId: number; firstName: string; lastName: string; dateOfBirth?: string; personCode: string; score: number }>
+  status: ReviewStatus
+  resolvedByUserId?: number
+  resolvedAt?: string
+  action?: ResolvedAction
+  createdAt: string
+}
+```
+
+Update `src/types/student.ts` and `src/types/user.ts` to add the new identity fields.
+
+---
+
+## 8. Routing & Authorization
+
+### 8.1 New route group: `_global-admin`
+
+**Files:**
+- `src/routes/_global-admin/route.tsx` — guard:
+  ```tsx
+  beforeLoad: () => {
+    const { auth } = useAuthStore.getState()
+    if (!auth.isAuthenticated()) throw redirect({ to: '/sign-in' })
+    if (!auth.hasRole('GlobalIdentityAdmin')) throw redirect({ to: '/_authenticated' })
+  }
+  ```
+- `src/routes/_global-admin/identity/review.tsx` — review queue list.
+- `src/routes/_global-admin/identity/review.$id.tsx` — single item, with merge/dismiss actions.
+- `src/routes/_global-admin/identity/users.$userId.merge-audit.tsx` — audit trail for a user.
+
+The layout for `_global-admin` should look visually distinct (different header color, "GLOBAL ADMIN" badge) so an admin always knows when they're operating cross-institute.
+
+### 8.2 Permission gates
+
+Add to `<PermissionGuard>` usages:
+- Review queue link in nav: `<PermissionGuard permission="identity:review">`.
+- Merge/split buttons: `<PermissionGuard permission="identity:merge">`, `<PermissionGuard permission="identity:split">`.
+
+Institute admins must NOT see the global-admin nav entry. Hide by role check, not just permission, since the backend strips `identity:*` perms when an institute context is present (defense in depth).
+
+### 8.3 Auth store extension
+
+`src/stores/auth-store.ts`:
+- Add `auth.isGlobalIdentityAdmin: () => boolean` (returns `roles.includes('GlobalIdentityAdmin')`).
+- No new instituteId logic — global admin endpoints are `BypassTenantFilters` on the server. The client can leave `X-Institute-Id` header empty or send it; the server ignores it for `/global-identity/*`.
+
+---
+
+## 9. Global Admin Screens (PII allowed here, audited)
+
+### 9.1 Review queue list
+**File:** `src/routes/_global-admin/identity/review.tsx`
+
+Table columns: created at, provisional user (FirstName, LastName, DOB), top candidate (FirstName, LastName, DOB, PersonCode), score, reason, status. Filter by status (Pending/Resolved/Dismissed) and reason.
+
+Row click → detail page.
+
+### 9.2 Review item detail
+**File:** `src/routes/_global-admin/identity/review.$id.tsx`
+
+Two-pane layout: provisional user (left), top candidate(s) (right). Show all matching candidates with their score and gate-pass results. Visual indicators for which gates passed/failed (green/red dots).
+
+Actions:
+- **Link to candidate** — opens confirmation dialog showing the merge plan ("This will combine 2 enrollments, 1 NFC card, $X in payments, …"). On confirm calls `globalIdentityService.merge`.
+- **Mark as new person** — calls `resolveReview({ action: 'NewPerson' })`. The provisional user keeps `IsCanonical = true`.
+- **Needs more info** — leaves status pending, adds an internal note.
+
+Every action shows a "Reason" textarea (free text, 200 chars) which is included in the audit log.
+
+### 9.3 Merge audit trail
+**File:** `src/routes/_global-admin/identity/users.$userId.merge-audit.tsx`
+
+Timeline of every merge that touched this user (as canonical or duplicate). Each row links to the snapshot. Includes a `Split` action for any merge (gated by `identity:split`).
+
+### 9.4 Direct merge (rarely used)
+A "Merge two users" page with two `userId` inputs. Backend computes a preview (no PII shown until both are entered). Only used when the matcher missed a duplicate that the admin spotted manually.
+
+---
+
+## 10. Phased Implementation Plan
+
+Mirrors the backend phases. Each phase = one branch, one PR.
+
+### Phase 1 — Types & service shape (no UI behavior change)
+
+**Goal:** Land all the new TS types and service signatures, even if backend isn't ready yet.
+
+- Add `src/types/guardian.ts`, `src/types/identity.ts`.
+- Update `src/types/student.ts`, `src/types/user.ts` with new fields (`personCode`, `gender`, `nic`, `dateOfBirth` on User).
+- Stub `guardian.service.ts`, `global-identity.service.ts` with the right shape; behind a feature flag the existing screens still call old endpoints.
+- No UI change yet.
+
+**Acceptance:** `pnpm tsc --noEmit` passes, `pnpm build` succeeds.
+
+### Phase 2 — Student form refactor
+
+- Replace Zod schema with the new shape.
+- Build `<GuardianPicker>` (with phone-lookup hook).
+- Build `<GenderSelect>`, `<NicInput>`, `<DobUnknownToggle>`.
+- Add the optional "Existing student ID" disclosure with `useResolvePersonCode`.
+- Remove all calls to `lookupIdentity`.
+- Update enroll mutation to send the new payload.
+- Render `<PersonCodeBadge>` and `<IdentityVerificationPill>` in success state.
+
+**Acceptance:** Manual test — register a student with all fields, verify payload matches backend contract, observe success without any cross-institute data in network response.
+
+### Phase 3 — Student detail enhancements
+
+- Add `<PersonCodeBadge>` to the header.
+- Add `<IdentityVerificationPill>` with auto-refresh while pending.
+- Add structured Guardians card; "Siblings at this institute" sub-list.
+- Add "Print card" action including PersonCode QR.
+
+**Acceptance:** Detail page shows guardians and siblings correctly. PII isolation verified — no other-institute hints in any response.
+
+### Phase 4 — Instructor enrollment
+
+- Create `src/features/instructors/` module mirroring `students/`.
+- `instructor-form.tsx` — same identity fields, no guardians (just `Self` contact).
+- `instructor-detail.tsx`.
+- Route: `_authenticated/instructors/`.
+- Service & hooks.
+
+**Acceptance:** Register an instructor end-to-end. Identity fields hit the same matcher.
+
+### Phase 5 — Global admin area
+
+- Create `_global-admin` route group + guard.
+- Distinct layout (header color, badge).
+- Review queue list + detail screens.
+- Merge confirmation dialog with preview.
+- Audit trail page.
+- Manual merge / split tooling.
+
+**Acceptance:** As `GlobalIdentityAdmin`, resolve a review item by linking to a candidate. Verify cross-institute data is visible. As an institute admin, attempt to access `/_global-admin/*` — blocked by route guard, and even if URL is hand-crafted, the backend returns 403.
+
+### Phase 6 — Polish & instrumentation
+
+- Telemetry: log (without PII) counts of "registrations", "person-code-resolved", "review-items-resolved" via existing analytics if any.
+- Error states for every new mutation.
+- Loading skeletons for review queue and detail.
+- Empty states.
+- Print stylesheet for PersonCode QR.
+
+---
+
+## 11. Test Plan
+
+### 11.1 Unit (Vitest)
+
+`src/features/students/__tests__/student-form.test.tsx`:
+- Validates Zod schema rejects missing `firstName`, `lastName`.
+- DOB unknown toggle nullifies DOB and shows the warning banner.
+- `personCode` regex: accepts `P-2026-000123`, rejects `p-2026-123` and `12345`.
+- At least one guardian required; exactly one primary.
+
+`src/features/guardians/__tests__/guardian-picker.test.tsx`:
+- Phone lookup prefills name on hit.
+- New guardian creates a row without `guardianId`.
+
+`src/components/__tests__/person-code-badge.test.tsx`:
+- Click copies value; toast fired.
+
+### 11.2 Integration (Playwright or Cypress, whichever is set up — verify; if neither, add Playwright)
+
+Scenarios — each scripts the full flow against a backend-double or stubbed API:
+
+1. **Register a brand-new student.**
+   - Fill all fields, submit, see success.
+   - Network tab: no `X-Other-Institute*` headers in response. Response payload doesn't contain any `otherInstitute*` fields.
+   - PersonCode badge displayed on detail page.
+2. **Register with PersonCode.**
+   - Type a valid `PersonCode`, see green check.
+   - Submit. Detail page shows pill = "Verified".
+3. **Register without PersonCode that auto-links in background.**
+   - Pill shows "Pending" then refreshes to "Verified" after worker completes.
+4. **Register two twins.**
+   - Both succeed, both get distinct `personCode`s, neither is flagged on the registrar UI.
+5. **Institute admin cannot access `/_global-admin/identity/review`.**
+   - Direct URL navigation → redirected away.
+6. **Global admin resolves a review item.**
+   - Sees both provisional and candidate PII.
+   - Confirms link; merge succeeds; audit trail shows new row.
+7. **Lookup leak regression.**
+   - Verify no UI surface displays an "exists at another institute" message at any point.
+
+### 11.3 Manual QA checklist
+
+- [ ] Print a card; scan the QR with a phone; verify it decodes to the `PersonCode` only.
+- [ ] Register a student with DOB unknown; confirm yellow warning shown.
+- [ ] Register with a deliberately malformed `PersonCode`; confirm form blocks submit.
+- [ ] As global admin in `_global-admin`, verify the layout is visually distinct.
+- [ ] Logout and back in; auth store reflects role correctly.
+
+---
+
+## 12. Accessibility & UX Notes
+
+- `<PersonCodeBadge>` must have proper ARIA label (`aria-label="Person code, click to copy"`).
+- The "DOB unknown" warning must use `role="status"` so screen readers announce it.
+- Color is never the only signal: gate-pass dots in review detail include text (`Pass` / `Fail`), not just color.
+- Keyboard navigation through `GuardianPicker` rows must support add/remove via focused buttons.
+- Print stylesheet for `PersonCode` QR uses CSS `@media print` to hide nav and inflate the QR.
+
+---
+
+## 13. Privacy & PII Engineering Rules
+
+These rules are part of the contract. Code reviews must enforce.
+
+1. **No client-side cross-institute query.** The PWA never asks the backend "does this person exist at another institute?". The only allowed cross-institute query for institute users is `resolvePersonCode(code) → { valid: boolean }`.
+2. **No rendering of fields whose origin is another institute.** If a backend response ever includes `otherInstituteName` or similar, it's a backend bug — file it, do not render.
+3. **Logs must not include PII.** Sentry / console logs in error handlers must scrub `name`, `email`, `phone`, `nic`, `dateOfBirth` from payloads.
+4. **Search params must not include PII.** No `?email=foo@bar.com` in URLs. Use POST bodies for lookups.
+5. **`X-Institute-Id` header is sent from `_authenticated` only**, not from `_global-admin`. The global-admin Axios call should explicitly omit it (use a separate Axios instance if needed).
+
+---
+
+## 14. Open Questions
+
+These do not block Phase 1 but should be answered before later phases:
+
+1. **i18n.** Adding cross-institute identity flow is a good moment to introduce `react-i18next`. Decision: defer to a separate workstream; this plan ships English strings.
+2. **QR library.** `qrcode.react` is recommended. Confirm bundle-size budget allows ~5KB gzip.
+3. **PersonCode display on home dashboard.** Should an enrolled student's PersonCode appear on the institute admin's dashboard widgets? Likely yes for support; flag for product.
+4. **Phone country default in `<GuardianPicker>`.** Default to `LK` (Sri Lanka) consistent with backend default. Confirm.
+5. **Layout differentiation for `_global-admin`.** Banner color/icon TBD with design.
+
+---
+
+## 15. Out of Scope
+
+- Self-service merge requests by end users.
+- Mobile-native NFC reading (existing manual UID flow preserved).
+- Bulk import / migration UI for existing data.
+- Real-time notifications to global admins about new review items (handled via email/SMS on backend; in-app push is a future enhancement).
+
+---
+
+## 16. Implementation order summary
+
+1. Phase 1 — types & service stubs
+2. Phase 2 — student form refactor + new components
+3. Phase 3 — student detail enhancements
+4. Phase 4 — instructor enrollment surface
+5. Phase 5 — global admin area
+6. Phase 6 — polish, telemetry, print styling
+
+Each phase ships independently. Backend phases 1–4 must be merged before frontend Phase 2 so the new endpoints exist.
+
+---
+
+## 17. Cross-references
+
+- Backend plan: [`cross-institute-identity.md`](./cross-institute-identity.md)
+- Existing security architecture: [`security-architecture.md`](./security-architecture.md) — extend the role/permission section with `GlobalIdentityAdmin` once Phase 5 lands.
+- Existing API design: [`api-design.md`](./api-design.md) — add the new `/global-identity/*`, `/guardians`, `/user-guardians` endpoints once Phase 1 of the backend ships.
+
+
+<div style="page-break-after: always;"></div>
+
+# Cross-Institute Identity — Final Implementation Plan
+
+**Status:** Approved design, ready to implement
+**Target implementer:** Claude Sonnet (or any engineer)
+**Owner of the design:** discussed with project owner; this document is the source of truth
+**Last updated:** 2026-05-02
+
+> Read this document in full before writing any code. It describes both the *what* and the *why*. The why matters when you hit edge cases — fall back to the principles, not your own judgement.
+
+---
+
+## 1. Goal
+
+Allow a single real human to be enrolled at multiple institutes (as student or instructor) with a single underlying global identity, while:
+
+1. **Working for minors with no NIC, no email, no birth certificate.** Birth certificates must NOT be requested — they're a UX tax we refuse to impose.
+2. **Correctly distinguishing twins** with the same DOB, same parent, same last name, no strong identifiers. The only thing differing is `FirstName`.
+3. **Never leaking PII across institutes.** Institute B's registrar must never see that this student exists at Institute A. Linking happens silently, in the background.
+4. **Supporting the same flow for instructors.** `InstructorEmployment` follows the same model.
+
+## 2. Non-Goals
+
+- Re-architecting tenancy. The existing `IInstituteContext` + EF query filter model is correct and stays.
+- Replacing `ApplicationUser`. It already plays the role of the global Person.
+- Building merge UX for institute admins. Merges are global-admin-only.
+- Importing identity data from external authorities. Out of scope.
+
+---
+
+## 3. Current State (as of 2026-05-02)
+
+Verified by reading the codebase. Use these as ground truth.
+
+### 3.1 Identity entities
+
+- `AMS.Domain/Entities/User/ApplicationUser.cs` — extends `IdentityUser<long>`. Carries `Guid UserId` (stable opaque id, auto-generated in property initializer), `FirstName`, `LastName`, audit fields, and a `DocketId`. **No `DateOfBirth`, `NIC`, `PersonCode`.** `Email` (from IdentityUser) is globally unique via Identity defaults.
+- `AMS.Domain/Entities/Student/Entity/StudentEnrollment.cs` — `Guid` PK; FKs `long UserId`, `Guid InstituteId`. Fields include `StudentCode`, `DateOfBirth`, free-text `GuardianName/Phone/Email`, `Address`, `EnrollmentNumber`, `Status`. Unique on `(UserId, InstituteId)` and `(StudentCode, InstituteId)`.
+- `AMS.Domain/Entities/Instructor/Entity/InstructorEmployment.cs` — `Guid` PK; FKs `long UserId`, `Guid InstituteId`. Carries a redundant `Name` plus `ContactEmail/Phone`, `JoinDate`, `IsActive`. Unique on `(UserId, InstituteId)`.
+- `AMS.Domain/Entities/Institute/Entity/InstituteUser.cs` — join table mapping users to institutes with `InstituteRole` enum. Unique on `(InstituteId, UserId)`.
+
+### 3.2 Tenancy
+
+- `AMS.Application/Interfaces/Institute/IInstituteContext.cs` — `Guid? CurrentInstituteId` from JWT claim or header.
+- `AMS.Infrastructure/Database/ApplicationDbContext.cs` — applies `HasQueryFilter` to scope `StudentEnrollment`, `InstructorEmployment`, `Class` by `CurrentInstituteId`. Has `BypassTenantFilters` flag for background jobs. `OnModelCreating` calls `ApplyConfigurationsFromAssembly` then `ApplyTenantQueryFilters` (lines 123–144). Domain events published in `SaveChangesAsync` via `PublishDomainEventsAsync` (line ~159).
+
+### 3.3 Migrations
+
+- `AMS.API/AMS.Infrastructure/Persistence/Migrations/`
+- Single greenfield migration: `20260501143551_InitialMigration.cs`. All tables prefixed `ams_`, schema `public`.
+
+### 3.4 Service Bus
+
+- `appsettings.json` (lines 35–51) configures topics: `transaction-events`, `charging-events`, `notification-events`. We will add `identity-events`.
+
+### 3.5 What's missing
+
+- No `DateOfBirth`, `NIC`, or human-readable `PersonCode` on `ApplicationUser`.
+- No `Guardian` entity. Guardian data is free-text on `StudentEnrollment` — siblings cannot share a normalized guardian.
+- No identity matching service, no merge tooling, no background worker for matching.
+- No `GlobalIdentityAdmin` role. All current roles are institute-scoped via `InstituteRole` enum.
+
+---
+
+## 4. Final Architecture
+
+### 4.1 Principles (read these first)
+
+1. **`ApplicationUser` IS the global Person.** No new Person entity. We enrich `ApplicationUser` with the missing identity fields.
+2. **Enrollments are per-institute.** `StudentEnrollment` and `InstructorEmployment` already have the right shape. Don't change their cardinality.
+3. **Guardians are normalized.** A `Guardian` entity owns the phone number; siblings share via a join table.
+4. **Matching is async and PII-isolated.** Registrar gets immediate success; matching happens in a background worker that runs as a system principal with `BypassTenantFilters = true`. Match results never surface to institute admins.
+5. **When in doubt, do not auto-merge.** A wrong merge corrupts attendance/fees data for two real humans. Splitting is possible but every split is a failure of the matcher.
+6. **First name is a gate, not a tiebreaker.** Twins with same DOB / same guardian must remain separate Persons.
+7. **Birth certificates are not used.** Even though we keep an optional column, never prompt for them, never depend on them.
+
+### 4.2 Enrich `ApplicationUser`
+
+Add these fields to `ApplicationUser` (file: `AMS.Domain/Entities/User/ApplicationUser.cs`):
+
+| Field | Type | Nullable | Notes |
+|---|---|---|---|
+| `DateOfBirth` | `DateOnly?` | yes | Strongly encouraged at registration. Without it, gate-based matching fails — only strong identifiers can match. |
+| `Gender` | `Gender?` (new enum) | yes | Used as a hard veto in matching: mismatched gender → never auto-merge. Values: `Male`, `Female`, `Other`, `PreferNotToSay`. |
+| `Nic` | `string?` | yes | National ID. **Partial unique** index `WHERE Nic IS NOT NULL`. |
+| `BirthCertificateNumber` | `string?` | yes | Optional, never prompted. Partial unique. Kept for institutes that already collect it. |
+| `PersonCode` | `string` | no | System-generated, human-readable, printable. Format: `P-{YYYY}-{6-digit-sequence}`. Globally unique. Stable forever (do not regenerate on merge). |
+| `IsLinkPending` | `bool` | no, default `true` | Flipped to `false` after the matcher has processed this user. |
+| `IsCanonical` | `bool` | no, default `true` | After a merge, the duplicate's row stays in the DB (audit) with `IsCanonical = false`, `IsDeleted = true`. |
+| `MergedIntoUserId` | `long?` | yes | If `IsCanonical = false`, points to the surviving canonical user. |
+
+Add domain methods:
+- `static ApplicationUser CreateProvisional(...)` — creates a new user with `IsLinkPending = true`, generates `PersonCode`.
+- `void MarkLinked()` — sets `IsLinkPending = false`. Called after matcher completes.
+- `void MarkMergedInto(long canonicalUserId)` — sets `IsCanonical = false`, `IsDeleted = true`, `MergedIntoUserId`. Called by merge service.
+- `void UpdateIdentityProfile(DateOnly? dob, Gender? gender, string? nic, string? birthCert)` — for admin corrections.
+
+**`PersonCode` generation.** Use a PostgreSQL sequence `ams_person_code_seq` and format in C#:
+
+```csharp
+public static string GeneratePersonCode(long sequenceValue, DateTime utcNow) =>
+    $"P-{utcNow:yyyy}-{sequenceValue:D6}";
+```
+
+Create the sequence in the migration (`SELECT setval('ams_person_code_seq', 1)` initial). Allocate a value via `_db.Database.SqlQueryRaw<long>("SELECT nextval('ams_person_code_seq')")`. Do this *before* persisting the user so the column is non-null on insert.
+
+### 4.3 Move `DateOfBirth` from `StudentEnrollment` to `ApplicationUser`
+
+DOB is a property of the human, not the enrollment. The migration must:
+1. Add `DateOfBirth` (and other identity columns) to `ApplicationUser`.
+2. Backfill: `UPDATE ams_users SET "DateOfBirth" = (SELECT "DateOfBirth" FROM ams_student_enrollments WHERE "UserId" = ams_users."Id" LIMIT 1) WHERE EXISTS (...)`.
+3. Drop `DateOfBirth` from `StudentEnrollment`.
+
+Update `StudentEnrollment.Create` to no longer accept `dateOfBirth`. Update `UpdateProfile` to no longer take it. Callers update DOB via a new `UpdateUserIdentity` flow on `ApplicationUser`.
+
+### 4.4 Normalize guardians
+
+New entities under `AMS.Domain/Entities/Guardian/`:
+
+**`Guardian`** (`Entity/Guardian.cs`):
+```
+Guid Id (PK)
+string PhoneNumber (required, unique after E.164 normalization)
+string? Name
+string? Email
+string? Nic
+audit fields (use BaseAuditableDomainEntity<Guid>)
+```
+
+**`UserGuardian`** (join):
+```
+Guid Id (PK)
+long UserId (FK ApplicationUser)
+Guid GuardianId (FK Guardian)
+GuardianRelationship Relationship  (enum: Father, Mother, Guardian, Sibling, Self, Other)
+bool IsPrimary
+audit fields
+Unique (UserId, GuardianId)
+```
+
+Place enum at `AMS.Domain/Shared/Enums/GuardianRelationship.cs`.
+
+**Phone normalization.** Before insert/lookup, normalize to E.164 (e.g. `+94771234567`). Store both `PhoneNumber` (normalized) and optionally `PhoneNumberOriginal`. Use `libphonenumber-csharp` NuGet package. The unique index is on `PhoneNumber` (normalized form).
+
+**Backfill.** Migrate `StudentEnrollment.GuardianName/Phone/Email` to `Guardian` + `UserGuardian` rows. Strategy:
+1. Group existing enrollments by normalized `GuardianPhone`.
+2. Create one `Guardian` per unique phone, with the most-recent name/email.
+3. Create one `UserGuardian` per enrollment linking the enrollment's `UserId` to the new `Guardian` with `Relationship = Guardian, IsPrimary = true`.
+4. Drop `GuardianName/Phone/Email` columns from `StudentEnrollment`.
+
+Same applies to `InstructorEmployment.ContactPhone/Email` — but for instructors, the relationship is `Self`. Drop `Name`, `ContactEmail`, `ContactPhone` from `InstructorEmployment` after backfill (use `ApplicationUser.FirstName/LastName` and `Email` instead). Keep `Designation`, `Qualification`, `Bio`, `JoinDate`, `IsActive` — those are employment-scoped.
+
+### 4.5 NFC cards stay enrollment-scoped
+
+`NfcCard.StudentEnrollmentId` is correct and unchanged. Cards are issued by an institute. After a merge, the card's enrollment FK is re-pointed transparently (because the duplicate's enrollment moves to the canonical user — see §6.3).
+
+### 4.6 New role: `GlobalIdentityAdmin`
+
+Create a global role outside `InstituteRole`:
+- Stored as an `ApplicationRole` row with name `GlobalIdentityAdmin`.
+- Seeded in migration.
+- Granted permissions: `identity:review`, `identity:merge`, `identity:split`, `identity:read-pii-cross-institute`.
+- This role bypasses institute scope (the relevant endpoints set `BypassTenantFilters = true` after authorization).
+
+**Institute admins must NOT have these permissions.** Add a guard in `PermissionService` that strips `identity:*` permissions if the user is acting under any `InstituteUser` context.
+
+---
+
+## 5. Matching Algorithm — Authoritative Spec
+
+### 5.1 Inputs to a match attempt
+
+Constructed at registration time:
+
+```csharp
+public record MatchInput(
+    long ProvisionalUserId,
+    string FirstName,
+    string LastName,
+    DateOnly? DateOfBirth,
+    Gender? Gender,
+    string? Nic,
+    string? Email,
+    string? PersonCode,            // optional — student-supplied
+    Guid? BirthCertificateId,
+    IReadOnlyList<Guid> GuardianIds,  // resolved Guardian rows by normalized phone
+    DateTime AttemptedAt
+);
+```
+
+### 5.2 Decision pipeline
+
+Run in this exact order. First terminal outcome wins.
+
+```
+STAGE 1 — STRONG PATH
+  if PersonCode matches an existing canonical user → AUTO-LINK
+  if Nic matches                                    → AUTO-LINK
+  if Email matches (and not in family-email allowlist) → AUTO-LINK
+
+STAGE 2 — HARD VETOES (eliminate candidates)
+  remove candidate if Gender present on both sides and differs
+  remove candidate if DateOfBirth present on both sides and differs
+
+STAGE 3 — GATE PATH (must pass ALL three gates)
+  Gate A — FirstName:
+    trigram_similarity(input.FirstName, candidate.FirstName) >= 0.85
+    OR DoubleMetaphone(input.FirstName) == DoubleMetaphone(candidate.FirstName)
+  Gate B — DateOfBirth:
+    both present AND exact match
+  Gate C — Guardian:
+    candidate has at least one GuardianId in input.GuardianIds
+
+  if any gate fails → candidate is NOT a match
+
+STAGE 4 — TWIN-CLUSTER DETECTION
+  let cluster = SELECT users WHERE DateOfBirth = input.DateOfBirth
+                AND EXISTS (UserGuardian where GuardianId IN input.GuardianIds)
+                AND IsCanonical = true
+  if cluster.Count >= 2:
+    raise FirstName gate to: trigram >= 0.92 AND DoubleMetaphone match AND Gender match
+    if any candidate still passes → REVIEW QUEUE (never auto-merge inside a twin cluster)
+
+STAGE 5 — COMPOSITE SCORE (only for candidates that passed all gates)
+  base = 0.70  // gates passed
+  + 0.10 if LastName trigram >= 0.85
+  + 0.10 if Gender both present and match
+  + 0.05 if OtherNames similarity >= 0.70  // if/when OtherNames is added
+  + 0.05 if Address similarity >= 0.70
+
+STAGE 6 — DECISION
+  if STAGE 1 hit                  → AUTO-LINK (confidence 1.0)
+  if score >= 0.92 AND not in cluster → AUTO-LINK
+  if score in [0.75, 0.92)        → REVIEW QUEUE
+  if score < 0.75                  → NEW PERSON (matcher leaves provisional user as canonical, sets IsLinkPending = false)
+```
+
+### 5.3 PostgreSQL extensions required
+
+In Migration 1:
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;       -- trigram similarity
+CREATE EXTENSION IF NOT EXISTS fuzzystrmatch; -- Double Metaphone
+```
+
+### 5.4 Candidate query (sketch)
+
+```sql
+SELECT u."Id", u."FirstName", u."LastName", u."DateOfBirth", u."Gender", u."Nic",
+       similarity(u."FirstName", @firstName) AS first_name_sim,
+       similarity(u."LastName", @lastName) AS last_name_sim,
+       dmetaphone(u."FirstName") AS first_name_dm
+FROM ams_users u
+JOIN ams_user_guardians ug ON ug."UserId" = u."Id"
+WHERE u."IsCanonical" = true
+  AND u."IsDeleted" = false
+  AND u."Id" <> @provisionalUserId
+  AND ug."GuardianId" = ANY(@guardianIds)
+  AND (u."DateOfBirth" IS NULL OR u."DateOfBirth" = @dob)
+  AND (u."Gender" IS NULL OR @gender IS NULL OR u."Gender" = @gender)
+  AND (
+        similarity(u."FirstName", @firstName) >= 0.85
+        OR dmetaphone(u."FirstName") = dmetaphone(@firstName)
+      )
+GROUP BY u."Id";
+```
+
+This MUST run with `BypassTenantFilters = true`.
+
+### 5.5 Family email allowlist
+
+Some parents register all children with the same email. To avoid auto-linking three siblings to one user when they share a parent's email, do not strong-match on Email alone if the email is already attached to ≥ 2 canonical users. In that case, fall through to the gate path.
+
+---
+
+## 6. Background Pipeline
+
+### 6.1 Event flow
+
+```
+Registration command (StudentEnrollment or InstructorEmployment)
+  └─> Domain event raised on ApplicationUser: IdentityMatchRequestedEvent { UserId, Source = Student|Instructor, EnrollmentId }
+       └─> MediatR handler in AMS.Application publishes to Service Bus topic 'identity-events'
+            └─> IdentityMatchingWorker consumes (subscription 'identity-matcher')
+                 ├─ runs matching pipeline
+                 ├─ if AUTO-LINK → MergePersonsCommand (system principal)
+                 ├─ if REVIEW QUEUE → insert IdentityReviewItem row, send notification to GlobalIdentityAdmin
+                 └─ if NEW PERSON → MarkLinked()
+```
+
+### 6.2 New Service Bus topic
+
+In `appsettings.json`:
+```json
+"AzureServiceBus": {
+  "Topics": {
+    ...
+    "IdentityEvents": "identity-events"
+  },
+  "Subscriptions": {
+    ...
+    "IdentityMatcher": "um-identity-matcher"
+  }
+}
+```
+
+### 6.3 Merge transaction (idempotent)
+
+`IIdentityMergeService.MergeAsync(long canonicalUserId, long duplicateUserId, MergeReason reason, string actorId)`:
+
+```
+BEGIN
+  set _instituteContext.BypassTenantFilters = true
+  if duplicateUserId.IsCanonical = false → return (already merged)
+
+  for each table with FK UserId:
+    StudentEnrollment, InstructorEmployment, InstituteUser, Payment, Attendance,
+    Notification, AuditLog, Docket, ApplicationUserRole, ApplicationUserClaim,
+    ApplicationUserLogin, ApplicationUserToken, UserGuardian
+  do:
+    UPDATE table SET UserId = canonical WHERE UserId = duplicate
+    handle unique constraint (UserId, InstituteId) clashes:
+      - StudentEnrollment: keep earliest EnrollmentDate, latest Status, merge Notes; delete duplicate enrollment
+      - InstructorEmployment: keep earliest JoinDate, latest IsActive; delete duplicate employment
+      - InstituteUser: keep highest InstituteRole; delete duplicate
+      - UserGuardian: ON CONFLICT DO NOTHING
+
+  duplicateUser.MarkMergedInto(canonical)  // sets IsCanonical=false, IsDeleted=true, MergedIntoUserId
+  insert PersonMergeAudit { canonicalId, duplicateId, score, reason, actorId, timestamp, snapshotJson }
+
+COMMIT
+```
+
+Make idempotent: re-running with the same args is a no-op after the first commit.
+
+### 6.4 Split (admin-only undo)
+
+`SplitPersonCommand` accepts a `PersonMergeAudit.Id`, restores the duplicate by:
+1. Set `IsCanonical = true`, `IsDeleted = false`, `MergedIntoUserId = null`.
+2. Re-point any FKs that were originally on the duplicate, using the snapshot JSON in the audit record.
+3. Insert a new `PersonMergeAudit` row with reason `Split` for traceability.
+
+Splits are rare. Keep the snapshot JSON for at least 1 year.
+
+### 6.5 Review queue
+
+New entity `IdentityReviewItem` (`AMS.Domain/Entities/Identity/Entity/IdentityReviewItem.cs`):
+```
+Guid Id
+long ProvisionalUserId
+long? CandidateUserId          // top candidate
+double Score
+ReviewReason Reason            // TwinClusterDetected | ScoreInReviewBand | GenderConflict | Other
+string CandidatesJson          // serialized list of all candidates with scores
+ReviewStatus Status            // Pending | Resolved | Dismissed
+long? ResolvedByUserId
+DateTime? ResolvedAt
+ResolvedAction? Action         // Linked | NewPerson | NeedsMoreInfo
+```
+
+Endpoint: `GET /api/global-identity/review` (lists pending), `POST /api/global-identity/review/{id}/resolve` (body: `{ action, candidateUserId? }`).
+
+Authorization: `[Authorize(Policy = "GlobalIdentityAdmin")]`. The endpoint sets `BypassTenantFilters = true` after authz.
+
+---
+
+## 7. Phased Implementation Plan
+
+Each phase is independently shippable and reviewable. Do them in order.
+
+### Phase 1 — Schema for global identity (foundation)
+
+**Goal:** Enrich `ApplicationUser`. No behavior change yet.
+
+Files:
+- `AMS.Domain/Entities/User/ApplicationUser.cs` — add fields, methods.
+- `AMS.Domain/Shared/Enums/Gender.cs` — new enum.
+- `AMS.Infrastructure/Database/Configurations/User/ApplicationUserConfiguration.cs` (create if absent) — partial unique indexes via `HasIndex(...).HasFilter(...)`.
+- `AMS.Infrastructure/Persistence/Migrations/<timestamp>_EnrichApplicationUserIdentity.cs` — generated via `dotnet ef migrations add`.
+
+Migration must:
+- Create extensions: `pg_trgm`, `fuzzystrmatch`.
+- Create sequence `ams_person_code_seq`.
+- Add columns `DateOfBirth`, `Gender`, `Nic`, `BirthCertificateNumber`, `PersonCode`, `IsLinkPending`, `IsCanonical`, `MergedIntoUserId`.
+- Backfill `PersonCode` for existing users using sequence values.
+- Add partial unique indexes on `Nic`, `BirthCertificateNumber`. Unique index on `PersonCode`.
+- After backfill, alter `PersonCode` to `NOT NULL`.
+
+EF index syntax for partial unique:
+```csharp
+builder.HasIndex(u => u.Nic)
+    .IsUnique()
+    .HasFilter("\"Nic\" IS NOT NULL");
+```
+
+**Acceptance:**
+- `dotnet build AMS.slnx` passes.
+- `dotnet ef database update` runs the new migration cleanly on a populated dev DB.
+- Existing users get a `PersonCode`. New `ApplicationUser` creation flow allocates a `PersonCode`.
+- Inserting two users with the same non-null `Nic` fails with a unique-violation. Inserting two users with NULL `Nic` succeeds.
+
+### Phase 2 — Move `DateOfBirth` and add `Guardian`
+
+**Goal:** DOB lives on the Person. Guardians are normalized.
+
+Files:
+- `AMS.Domain/Entities/Guardian/Entity/Guardian.cs` — new.
+- `AMS.Domain/Entities/Guardian/Entity/UserGuardian.cs` — new.
+- `AMS.Domain/Shared/Enums/GuardianRelationship.cs` — new enum.
+- `AMS.Domain/Entities/Guardian/Interfaces/IGuardianRepository.cs` — new.
+- `AMS.Infrastructure/Repositories/Guardian/GuardianRepository.cs` — new.
+- `AMS.Infrastructure/Database/Configurations/Guardian/*.cs` — EF configs.
+- `AMS.Infrastructure/Database/ApplicationDbContext.cs` — add `DbSet<Guardian>`, `DbSet<UserGuardian>`.
+- `AMS.Application/Services/Phone/IPhoneNormalizer.cs` + impl in Infrastructure using `libphonenumber-csharp`.
+- `AMS.Domain/Entities/Student/Entity/StudentEnrollment.cs` — remove `DateOfBirth`, `GuardianName`, `GuardianPhone`, `GuardianEmail`. Update `Create` and `UpdateProfile` signatures.
+- `AMS.Domain/Entities/Instructor/Entity/InstructorEmployment.cs` — remove `Name`, `ContactEmail`, `ContactPhone`. Update `Create` and `Update`.
+- All command handlers and DTOs that reference removed fields — update to either pass through to `ApplicationUser` (DOB) or to `UserGuardian` (guardian fields).
+- `AMS.Infrastructure/Persistence/Migrations/<timestamp>_NormalizeGuardiansAndMoveDob.cs`.
+
+Migration must:
+- Create `ams_guardians` and `ams_user_guardians` tables.
+- Backfill DOB: `UPDATE ams_users u SET "DateOfBirth" = se."DateOfBirth" FROM ams_student_enrollments se WHERE u."Id" = se."UserId" AND se."DateOfBirth" IS NOT NULL`.
+- Backfill guardians: insert one `Guardian` per unique normalized phone (use a CTE), then one `UserGuardian` per `StudentEnrollment` with non-null guardian phone.
+- Backfill instructors as `Self` relationships from `InstructorEmployment.ContactPhone`.
+- Drop `DateOfBirth`, `GuardianName`, `GuardianPhone`, `GuardianEmail` from `ams_student_enrollments`.
+- Drop `Name`, `ContactEmail`, `ContactPhone` from `ams_instructor_employments`.
+
+**Acceptance:**
+- All existing tests pass after refactoring command/handler signatures.
+- A query for "all users with guardian phone X" returns the correct set after backfill.
+- Three sibling users sharing a guardian phone produce 1 `Guardian` row + 3 `UserGuardian` rows.
+
+### Phase 3 — Identity matching service (no background yet)
+
+**Goal:** Pure synchronous matching service that anyone can call. No worker, no merge yet.
+
+Files:
+- `AMS.Application/IdentityMatching/IIdentityMatchingService.cs` — interface.
+- `AMS.Application/IdentityMatching/Models/MatchInput.cs`, `MatchResult.cs`, `MatchCandidate.cs`, `MatchDecision.cs` (enum: `AutoLink | ReviewQueue | NewPerson`).
+- `AMS.Infrastructure/Services/IdentityMatching/IdentityMatchingService.cs` — implementation following §5.2 exactly.
+- `AMS.Infrastructure/Services/IdentityMatching/TwinClusterDetector.cs`.
+- `AMS.Infrastructure/Services/IdentityMatching/NameSimilarity.cs` — wraps `pg_trgm` and `dmetaphone` calls via raw SQL or `EF.Functions.TrigramsSimilarity` if available.
+- DI wiring in `AMS.Infrastructure/DependencyInjection.cs`.
+
+The service must:
+- Always set `_instituteContext.BypassTenantFilters = true` while running.
+- Return a `MatchResult` with `Decision`, top `Candidate`, and full ranked list. **It does not mutate state.**
+- Be unit-testable without a real Service Bus.
+
+**Acceptance:** Unit tests cover (use fixtures, no real DB needed for pure scoring; integration tests for the SQL-bound pieces):
+- Twin scenario: two users with same DOB + shared guardian + different first names → both kept separate.
+- Re-enrollment: same first name + DOB + guardian → AUTO-LINK.
+- Twin re-enrollment: cluster of 2 detected, same FirstName trigram 0.93, DM match, gender match → REVIEW QUEUE (never auto-merge inside a cluster).
+- Gender mismatch + everything else matching → NEW PERSON.
+- Strong path: matching `Nic` overrides everything else → AUTO-LINK.
+- Family email: an email shared by 2 existing users → fall through to gate path (no email auto-link).
+- Missing DOB on candidate → gate B fails → NEW PERSON unless strong path.
+
+### Phase 4 — Background worker + Service Bus wiring
+
+**Goal:** Async pipeline. Enrollment fires an event; worker resolves it.
+
+Files:
+- `AMS.Domain/DomainEvents/Identity/IdentityMatchRequestedEvent.cs`.
+- `AMS.Application/EventHandlers/Identity/IdentityMatchRequestedHandler.cs` — relays to Service Bus.
+- `AMS.Infrastructure/BackgroundServices/IdentityMatchingWorker.cs` — `BackgroundService` consuming the subscription. On each message: open scope, call `IIdentityMatchingService`, then call merge or insert review item or just `MarkLinked`.
+- `appsettings.json` + `appsettings.Development.json` — add the new topic/subscription.
+- `Program.cs` — register the hosted service.
+- `AMS.Application/Commands/Student/RegisterStudent/RegisterStudentCommandHandler.cs` (and Instructor equivalent) — at the end of registration, raise `IdentityMatchRequestedEvent` on the `ApplicationUser` aggregate.
+
+**Acceptance:**
+- Registering a new student fires the event, the worker picks it up within 5s in dev, and `IsLinkPending` flips to `false`.
+- Worker is idempotent: replaying the same message produces no duplicate state change.
+- Worker dead-letters poisoned messages after 3 failures; no infinite loops.
+
+### Phase 5 — Merge / split / review queue
+
+**Goal:** Tooling for the auto-link decision and global-admin overrides.
+
+Files:
+- `AMS.Domain/Entities/Identity/Entity/IdentityReviewItem.cs`.
+- `AMS.Domain/Entities/Identity/Entity/PersonMergeAudit.cs`.
+- `AMS.Application/Commands/Identity/MergePersons/MergePersonsCommand.cs` + handler + validator.
+- `AMS.Application/Commands/Identity/SplitPerson/SplitPersonCommand.cs` + handler + validator.
+- `AMS.Application/Queries/Identity/ListReviewItems/ListReviewItemsQuery.cs` + handler.
+- `AMS.Application/Commands/Identity/ResolveReviewItem/ResolveReviewItemCommand.cs` + handler.
+- `AMS.Api/Controllers/GlobalIdentityController.cs` — extends `BaseApiController`, gated by `[Authorize(Policy = "GlobalIdentityAdmin")]`.
+- `AMS.Infrastructure/Services/Permission/PermissionService.cs` — strip `identity:*` permissions when current principal has any `InstituteUser` claim attached.
+- Seed `GlobalIdentityAdmin` role + permissions (`identity:review`, `identity:merge`, `identity:split`, `identity:read-pii-cross-institute`) in the seeder.
+
+**Acceptance:**
+- Merging two users transactionally re-points all FKs and survives a unique-constraint clash on `(UserId, InstituteId)`.
+- Audit row written for every merge with snapshot JSON.
+- Split restores the previous state from the audit snapshot.
+- Institute admin (no global role) gets 403 on review endpoints.
+- An institute admin who is *also* a `GlobalIdentityAdmin` can only use the global endpoints from a session without an institute context (verify via integration test).
+
+### Phase 6 — Registration UX changes (no PII leak)
+
+**Goal:** Registrar-facing flow honors PII isolation. `PersonCode` becomes an optional input.
+
+Files:
+- `AMS.Application/Commands/Student/RegisterStudent/RegisterStudentCommand.cs` — add optional `PersonCode`. If present, `RegisterStudentCommandHandler` resolves it to an existing canonical `ApplicationUser` and creates a new `StudentEnrollment` against it directly (no provisional user, no matcher needed). Wraps in transaction.
+- Same for `RegisterInstructorCommand`.
+- API DTOs and PWA forms — add optional `PersonCode` field labeled "Existing student ID (if any)".
+- The registration response **must not** indicate whether a match was found. It returns the institute-local enrollment view only. The link, if any, happens silently in the background.
+- Audit log entry on registration must NOT include any cross-institute identifiers (e.g. don't log "linked to existing user from Institute X").
+
+**Acceptance:**
+- Registering with a valid `PersonCode` skips the matcher and links directly.
+- Registering without a `PersonCode` always returns success immediately. Background worker resolves the link within seconds.
+- Inspecting the API response with browser devtools reveals no other-institute identifiers.
+
+---
+
+## 8. Test Plan
+
+### 8.1 Unit tests (no DB)
+
+In `AMS.Tests/IdentityMatching/`:
+- `MatchingPipelineTests.cs` — covers all decision branches in §5.2 with hand-rolled fixtures.
+- `TwinClusterDetectorTests.cs`.
+- `PersonCodeGeneratorTests.cs` — format, no collisions across years.
+- `PhoneNormalizerTests.cs` — Sri Lankan numbers `077...`, `+94 77...`, etc.
+
+### 8.2 Integration tests (Testcontainers PostgreSQL)
+
+In `AMS.Tests/Integration/IdentityMatching/`:
+- `RegisterAtTwoInstitutesAutoLinksTest.cs` — same person registers at A then B with same first name, DOB, and parent phone → second registration's enrollment ends up pointing to the first user's `Id` after the worker runs.
+- `TwinsRegisterAtSameInstituteTest.cs` — Alice and Bob register; verify two distinct `ApplicationUser` rows.
+- `TwinReEnrollsAtSecondInstituteTest.cs` — Alice (twin) re-enrolls at B; verify item lands in review queue, not auto-merged.
+- `MergeIdempotencyTest.cs`.
+- `SplitRestoresStateTest.cs`.
+- `InstituteAdminCannotSeeReviewQueueTest.cs`.
+- `RegistrationResponseHasNoCrossInstitutePiiTest.cs` — assert response payload after registration contains no `OtherInstitute*` keys, no other `PersonCode`s.
+
+### 8.3 Manual QA checklist
+
+After Phase 6 ships, run through:
+- [ ] Register a brand-new student. Observe matcher logs show "NEW PERSON".
+- [ ] Register the same student (same first name, DOB, parent phone) at a second institute. Observe matcher logs show "AUTO-LINK". UI at second institute shows enrollment normally with no other-institute hints.
+- [ ] Register two twins at the same institute. Observe two distinct users.
+- [ ] Re-enroll one twin at a second institute. Observe a review item appears for `GlobalIdentityAdmin`.
+- [ ] As global admin, resolve review item → "Link" → second institute's enrollment now points to the first twin's user.
+- [ ] Confirm institute admin cannot access `/api/global-identity/*` (403).
+
+---
+
+## 9. Operational Runbook
+
+- **Matcher backlog grows.** Check `IdentityMatchingWorker` logs in Seq. Likely cause: Service Bus subscription disabled or DB pool exhaustion.
+- **Wrong merge in production.** Find the `PersonMergeAudit` row, run `SplitPersonCommand` with that audit id. The duplicate user is restored from the snapshot. Re-trigger matching only after manually correcting the inputs that caused the false positive.
+- **Twin appears as one record.** If users report "my child's attendance is mixed up with their twin", that's a symptom of a wrong auto-merge. Run `SELECT * FROM ams_person_merge_audit WHERE canonicaluserid = X OR duplicateuserid = X` to find the merge, then split.
+- **A returning student wasn't auto-linked.** Likely the `FirstName` trigram fell below 0.85 (e.g. spelling drift) OR the parent's phone changed and the gate failed. Resolution: a global admin uses the review queue if it's there; otherwise registers normally and uses `MergePersonsCommand` later. Optionally, registrar can ask the student for a `PersonCode` next time.
+
+---
+
+## 10. Open Questions (decide before implementation)
+
+These don't block schema work but should be resolved before Phase 6 ships:
+
+1. **Family-email allowlist size.** What's "≥ 2 users"? Or do we want a configurable threshold per environment?
+2. **`OtherNames` / middle name field.** Recommended to add to `ApplicationUser` to disambiguate same-FirstName twins. Not in this plan because not yet collected anywhere — flag for product.
+3. **Auto-merge confidence threshold.** Currently 0.92. Tune after observing review-queue volume in production.
+4. **Phone country default.** `libphonenumber-csharp` needs a region for ambiguous numbers. Default to `LK` (Sri Lanka) based on project context — confirm.
+5. **PersonCode visibility on cards.** Should the PWA card-checking surface display `PersonCode` to swipe operators? Likely yes, for support; not part of this plan but flagged.
+
+---
+
+## 11. What this plan deliberately does NOT include
+
+- A self-serve "merge my own duplicates" flow for end users. All merges are admin-mediated.
+- Cross-region replication of `Guardian` data. Out of scope.
+- Soft fingerprinting (browser/device-based identity hints). Privacy-hostile and unreliable.
+- Photo-based matching. Way out of scope.
+
+---
+
+## 12. Implementation order summary
+
+1. Phase 1 — enrich `ApplicationUser` + extensions + sequence (1 migration)
+2. Phase 2 — move DOB up, normalize guardians (1 migration + entity refactor)
+3. Phase 3 — `IIdentityMatchingService` synchronous, fully unit/integration tested
+4. Phase 4 — domain event + Service Bus + background worker
+5. Phase 5 — merge/split/review tooling + `GlobalIdentityAdmin` role
+6. Phase 6 — registration UX changes + `PersonCode` input
+
+Each phase = its own branch, its own PR, its own review.
+
+---
+
+## 13. Glossary
+
+- **Person** — a real human. Represented by a row in `ams_users` (canonical `ApplicationUser`).
+- **Enrollment** — a relationship between a Person and an Institute as a student or instructor.
+- **PersonCode** — printable, stable, globally unique string. The "passport" a student carries between institutes.
+- **Provisional user** — an `ApplicationUser` row with `IsLinkPending = true`. Functionally complete; pending matching outcome.
+- **Canonical user** — an `ApplicationUser` row with `IsCanonical = true`. The surviving identity after merges.
+- **Twin cluster** — ≥ 2 canonical users sharing the same `(DateOfBirth, Guardian)` tuple. Auto-merge is disabled inside clusters.
+- **GlobalIdentityAdmin** — the only role allowed to see PII across institutes. Lives outside `InstituteRole`.
+
+
+<div style="page-break-after: always;"></div>
+
 # 🗄️ Database Design
 
 > Comprehensive database schema design for the Attendance Management System
@@ -2936,6 +4099,579 @@ graph LR
 
 **Previous:** [System Architecture](./system-architecture.md) | **Next:** [API Design](./api-design.md)
 
+
+
+<div style="page-break-after: always;"></div>
+
+# Multi-Tenant Subdomain Access
+
+Tenant-scoped URLs (`<slug>.classpass.lk`) with a dedicated system-admin root (`portal.classpass.lk`) and a single backend host (`api.classpass.lk`). Industry-standard pattern (Slack / Zendesk / Atlassian style) adapted to the existing AMS Clean Architecture solution.
+
+This document is the source of truth for the rollout. It cross-references existing code so every "what changes" line is concrete.
+
+---
+
+## 1. Goals
+
+- Each institute gets a dedicated, brandable URL: `royal-college.classpass.lk`.
+- Privileged institute users land on a tenant-branded sign-in screen and, after login, see only their institute's nav — no switcher, no global-admin tabs.
+- SystemAdmins (and anyone holding `institutes:access-any`) on a tenant subdomain are **scoped to that tenant**; they go to `portal.classpass.lk` for cross-tenant work.
+- One API host serves every tenant. Token-vs-host mismatch is rejected server-side; the tenant **cannot be changed** while logged in via a tenant subdomain.
+- The architecture survives a future VPS → Azure backend migration with config changes only.
+
+## 2. Non-goals
+
+- Custom per-institute apex domains (e.g. `portal.royal-college.lk`). Deferrable to a paid tier later.
+- Cross-subdomain SSO. Cookies stay per-subdomain by design.
+- Tenant-specific data residency. All tenants share one Postgres DB; isolation is logical via `InstituteId` columns + EF query filters (already in place).
+
+## 3. Domain & hosting
+
+### URL layout
+
+| Host | Audience | Behaviour |
+|---|---|---|
+| `portal.classpass.lk` | SystemAdmins, multi-institute users | Existing experience: generic sign-in, institute switcher, all admin tabs. |
+| `<slug>.classpass.lk` | Institute admins + privileged institute users | Branded sign-in; JWT bound to that institute; switcher hidden; tenant-scoped nav. |
+| `api.classpass.lk` | Both PWA experiences | Single backend host. Dynamic CORS allows the root + every known tenant origin. |
+| `www.classpass.lk` | — | 301 to `portal.classpass.lk`. |
+
+Reserved subdomains (never assignable as slugs): `portal`, `api`, `www`, `app`, `admin`, `static`, `assets`, `cdn`, `mail`, `docs`, `status`, `pages`, `dev`, `staging`.
+
+### Why single-level wildcard
+
+Cloudflare's Universal SSL covers `*.classpass.lk` and `classpass.lk` for free. A two-level pattern (`*.app.classpass.lk`) would need Advanced Certificate Manager (~$10/mo).
+
+### Hosting
+
+- **DNS**: Cloudflare (domain registered at register.lk).
+- **Frontend (AMS.PWA)**: Cloudflare Pages. The current Netlify free tier rejects unknown Host headers, and the Pro plan ($19/mo) trades real money for a worse fit than Pages (same vendor as DNS, native wildcards, unlimited bandwidth, free).
+- **Backend (AMS.Api)**: .NET 9 on a VPS today (nginx → Kestrel, Let's Encrypt DNS-01 via Cloudflare). Designed to lift-and-shift to Azure App Service / Container Apps later; no code path is host-aware.
+- **Storage**: already Azure Blob + Azure Service Bus (per `appsettings.json`).
+
+---
+
+## 4. Existing code we build on
+
+The system already does most of the heavy lifting; this plan extends rather than replaces.
+
+| Concept | Existing artefact | Notes |
+|---|---|---|
+| Tenant entity | `AMS.Domain/Entities/Institute/Entity/Institute.cs` | Has `Code`, `Name`, `LogoUrl`, `Settings (jsonb)`, `IsActive`. Adds `Slug` + `BrandingTheme`. |
+| Repository | `AMS.Domain/Entities/Institute/Interfaces/IInstituteRepository.cs` + `AMS.Infrastructure/Repositories/Institute/InstituteRepository.cs` | Has `GetByCodeAsync`. Adds `GetBySlugAsync` / `ExistsBySlugAsync`. |
+| EF config | `AMS.Infrastructure/EntityConfigurations/Institute/InstituteEntityConfig.cs` | Adds `slug` column + unique lowercase index, `branding_theme` jsonb. |
+| Membership | `InstituteUser` + `IInstituteUserRepository.ExistsAsync` | Unchanged; remains the source of truth for "can this user act in this institute". |
+| Tenant context | `AMS.Application/Interfaces/Institute/IInstituteContext.cs` + `AMS.Infrastructure/Services/Institute/InstituteContext.cs` | Precedence becomes: host > header > JWT claim. New `InstituteContextSource.Host`. |
+| Enforcement | `AMS.Api/Middleware/InstituteContextEnforcementMiddleware.cs` | Adds host-vs-token mismatch check. Adds `/api/public` to exempt list. |
+| Logging | `InstituteContextLoggingMiddleware` | Picks up the new source enum for free. |
+| Login | `AMS.Application/Handlers/User/Commands/LoginApplicationUserCommand.cs` | Already accepts `Guid? InstituteId`. Controller now resolves from host or body slug. |
+| Switch | `AMS.Application/Handlers/Auth/Commands/SwitchInstituteCommand.cs` | Add tenant-host rejection in handler. |
+| Auth `/me` | `AuthController.GetCurrentUser` | Add `TenantSlug` field. |
+| PWA auth store | `AMS.PWA/src/stores/auth-store.ts` | Add `canSwitchInstitute()` derived from host. |
+| PWA api client | `AMS.PWA/src/lib/api-client.ts` | Stop sending `X-Institute-Id` header on tenant hosts (server ignores it anyway, but cleaner). |
+| PWA switcher | `AMS.PWA/src/components/layout/institute-switcher.tsx` | Replaced by `InstituteBadge` on tenant hosts. |
+| PWA sidebar | `AMS.PWA/src/components/layout/data/sidebar-data.ts` + `app-sidebar.tsx` | Items gain `requiredPermission` / `requiredRole` / `visibleOnRootOnly`; new `useSidebarData()` filters them. |
+| PWA cookies | `AMS.PWA/src/lib/cookies.ts` | Already host-scoped (no `Domain=` attribute). Per-subdomain isolation works for free. |
+| PWA SPA redirect | `AMS.PWA/netlify.toml` | Replaced by `public/_redirects`. |
+| CORS | `AMS.Infrastructure/DependencyInjection.cs:708` (`AddCorsInternal`) | Already calls `SetIsOriginAllowedToAllowWildcardSubdomains()` — wildcard origin like `https://*.classpass.lk` just works. We add a delegate guard so unknown slugs are rejected and the `portal` origin is explicitly allowed. |
+| nginx | `AMS.WIKI/deployment/ams-nginx.conf` | Today serves PWA + proxies API. Split: PWA moves to Cloudflare Pages; nginx becomes API-only at `api.classpass.lk`. |
+
+---
+
+## 5. Phase 0 — Infrastructure foundation
+
+> Operator task list; not code.
+
+### 5.1 Cloudflare DNS
+
+| Type | Name | Target | Proxy |
+|---|---|---|---|
+| A | `api` | VPS public IP | ✅ proxied (orange cloud) |
+| CNAME | `portal` | `<pages-project>.pages.dev` | ✅ proxied |
+| CNAME | `*` | `<pages-project>.pages.dev` | ✅ proxied |
+| CNAME | `www` | `portal.classpass.lk` | ✅ proxied |
+
+### 5.2 TLS
+
+- Universal SSL auto-provisions `*.classpass.lk` and `classpass.lk` — verify under **SSL/TLS → Edge Certificates**.
+- VPS cert for `api.classpass.lk` via certbot + `python3-certbot-dns-cloudflare` plugin and a scoped Cloudflare API token (Zone:DNS:Edit on `classpass.lk` only).
+
+### 5.3 Cloudflare Pages
+
+- Connect AMS.PWA repo; build `npm run build`, output `dist`.
+- Custom domains: `portal.classpass.lk`, `*.classpass.lk`, `www.classpass.lk`.
+- Env vars: `VITE_API_BASE_URL=https://api.classpass.lk/api`, `VITE_ROOT_HOST=classpass.lk`, `VITE_ADMIN_SUBDOMAIN=portal`.
+
+### 5.4 nginx on the VPS
+
+Replace `AMS.WIKI/deployment/ams-nginx.conf` with an API-only vhost on `api.classpass.lk` that terminates TLS, proxies to Kestrel on `127.0.0.1:5000`, and trusts Cloudflare's published IP ranges as `set_real_ip_from`. The PWA `root` and SPA-fallback blocks come out — Pages serves the frontend.
+
+### 5.5 Backend forwarded-headers
+
+`Program.cs` must call `app.UseForwardedHeaders` before `UseAuthentication` so Kestrel honours `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host` from Cloudflare. Restrict via `KnownNetworks` / `KnownProxies` to Cloudflare's published ranges.
+
+### 5.6 Acceptance
+
+```
+curl https://api.classpass.lk/health                            # 200 from VPS
+curl -I https://portal.classpass.lk                             # 200 from Pages
+curl -I https://anything-unknown-yet.classpass.lk               # 200 (SPA), 404 inside app
+```
+
+---
+
+## 6. Phase 1 — Domain & data
+
+### 6.1 `Institute` entity (`AMS.Domain/Entities/Institute/Entity/Institute.cs`)
+
+- New private setter `Slug` (string, required after backfill).
+- New private setter `BrandingTheme` (string?, JSON: `{ accentColor, secondaryColor, tagline }`).
+- `Create` overload accepts `slug`.
+- Method `ChangeSlug(string newSlug)` raises `InstituteSlugChangedEvent` (domain event).
+- Validation in the entity: regex `^[a-z][a-z0-9-]{1,38}[a-z0-9]$`; reject any value in `ReservedSlugs`.
+
+### 6.2 Constants
+
+- `AMS.Domain.Constants.ReservedSlugs` — `IReadOnlyCollection<string>` literal list (above).
+- Mirror in PWA: `AMS.PWA/src/lib/reserved-slugs.ts` for client-side pre-check.
+
+### 6.3 EF config (`InstituteEntityConfig.cs`)
+
+```csharp
+builder.Property(x => x.Slug)
+    .HasColumnName("slug")
+    .IsRequired()
+    .HasMaxLength(40);
+builder.Property(x => x.BrandingTheme)
+    .HasColumnName("branding_theme")
+    .HasColumnType("jsonb");
+builder.HasIndex(x => x.Slug)
+    .IsUnique()
+    .HasDatabaseName("IX_Institutes_Slug");
+```
+
+Postgres index uses `LOWER(slug)` semantics via a check constraint or by always lower-casing on write (we lowercase in the entity). Single-column unique index is enough since the entity guarantees lowercase.
+
+### 6.4 Repository (`IInstituteRepository`, `InstituteRepository`)
+
+```csharp
+Task<Institute?> GetBySlugAsync(string slug, CancellationToken ct = default);
+Task<bool> ExistsBySlugAsync(string slug, CancellationToken ct = default);
+```
+
+### 6.5 Migration
+
+`dotnet ef migrations add AddInstituteSlugAndBranding --project AMS.Infrastructure --startup-project AMS.Api`
+
+- Add `slug` nullable, `branding_theme` jsonb nullable.
+- Backfill `slug` from `LOWER(code)` (strip the `INST-` prefix if you want shorter slugs — confirm with stakeholders before deciding; default is to keep `inst-2026-0001` style and let admins rename later).
+- Set NOT NULL on `slug`; add the unique index.
+
+### 6.6 Tests (`AMS.Tests`)
+
+- Slug regex accepts/rejects per spec.
+- Reserved-slug rejection.
+- `ChangeSlug` raises the domain event.
+- `GetBySlugAsync` is case-insensitive in queries (`.ToLowerInvariant()` on input).
+
+### 6.7 Acceptance
+
+Dev DB migrates cleanly; every existing institute has a non-null slug; calling `GetBySlugAsync("inst-2026-0001")` returns the matching row.
+
+---
+
+## 7. Phase 2 — API tenant resolution
+
+### 7.1 Slug resolver
+
+`AMS.Application/Interfaces/Institute/IInstituteSlugResolver.cs`
+
+```csharp
+public interface IInstituteSlugResolver
+{
+    Task<InstituteSlugInfo?> ResolveAsync(string slug, CancellationToken ct);
+    void Invalidate(string slug);
+}
+public sealed record InstituteSlugInfo(Guid Id, string Slug, bool IsActive);
+```
+
+Implementation in `AMS.Infrastructure/Services/Institute/InstituteSlugResolver.cs`. Backed by `IInstituteRepository` + `IMemoryCache` (60s sliding TTL). Invalidate from a `INotificationHandler<InstituteSlugChangedEvent>` and from create/deactivate handlers.
+
+### 7.2 Tenant host context
+
+`AMS.Application/Interfaces/Institute/ITenantHostContext.cs`
+
+```csharp
+public interface ITenantHostContext
+{
+    string? Slug { get; }
+    Guid? InstituteId { get; }
+    bool IsTenantHost { get; }
+    bool IsRootHost { get; }   // portal.classpass.lk or apex
+}
+```
+
+Implementation reads `HttpContext.Items[TenantContextKey]` set by the middleware below. Registered scoped.
+
+### 7.3 `TenantResolutionMiddleware`
+
+`AMS.Api/Middleware/TenantResolutionMiddleware.cs`. Runs immediately after `UseRouting` and before `UseAuthentication`.
+
+```text
+host = forwarded host || request.host
+suffix = config["Tenant:RootHostSuffix"]            // "classpass.lk"
+admin  = config["Tenant:AdminSubdomain"]            // "portal"
+label  = host minus suffix (first label)
+
+if label is null OR label == "www" OR label == suffix → IsRootHost=true
+elif label == admin                                  → IsRootHost=true
+elif label in ReservedSlugs                          → 404 tenant_unknown
+else:
+    info = await resolver.ResolveAsync(label)
+    if info is null              → 404 tenant_unknown
+    elif !info.IsActive          → 410 tenant_inactive
+    else:
+        Items[TenantContextKey] = new TenantHostContext(label, info.Id)
+```
+
+The 404/410 response is a small JSON `{ error, slug }` so the PWA can render a clean page when it hits the API directly. The middleware skips `/health` and `/swagger`.
+
+### 7.4 `InstituteContext` precedence change
+
+`AMS.Infrastructure/Services/Institute/InstituteContext.cs`. New precedence:
+
+1. `ITenantHostContext.InstituteId` (Source = `Host`)
+2. `X-Institute-Id` header (Source = `Header`) — ignored if the host context disagrees; log a warning.
+3. JWT `institute_id` claim (Source = `JwtClaim`)
+
+Extend `InstituteContextSource` with `Host = 3`.
+
+### 7.5 `InstituteContextEnforcementMiddleware` hardening
+
+`AMS.Api/Middleware/InstituteContextEnforcementMiddleware.cs`:
+
+- Add `/api/public` to `ExemptPathPrefixes`.
+- New rule executed before the existing membership check:
+  ```
+  if tenantHost.IsTenantHost && jwt.institute_id is set
+     && jwt.institute_id != tenantHost.InstituteId
+  → 403 tenant_token_mismatch
+  ```
+  This is the cross-tenant token-replay defence.
+- Super-admins on tenant hosts must still pass the existing membership check **OR** hold `Institutes.AccessAny`. (Current code already short-circuits on `AccessAny`; we keep that — being on a tenant host doesn't strip the permission, it just locks the institute scope.)
+
+### 7.6 Auth surface changes
+
+#### `LoginApplicationUserCommand`
+
+Already takes `Guid? InstituteId`. We do **not** add `InstituteSlug` to the application-layer record; the controller (which has access to `ITenantHostContext`) resolves and forwards an `InstituteId`:
+
+```csharp
+[HttpPost("login")]
+public async Task<IActionResult> Login(
+    [FromBody] LoginApplicationUserCommand command,
+    [FromServices] ITenantHostContext tenant)
+{
+    if (tenant.IsTenantHost && tenant.InstituteId is { } hostInstituteId)
+        command = command with { InstituteId = hostInstituteId };
+
+    var result = await Mediator.Send(command);
+    return HandleResult(result);
+}
+```
+
+This keeps the application contract clean and ensures any host-supplied institute always wins over a client-supplied one — no spoofing.
+
+**Error parity**: keep `Error.NotFound("User", …)` for unknown emails. To remove the enumeration leak on tenant hosts, the handler should collapse "user not found", "wrong password", and "not a member of this institute" to the same `Error.Unauthorized("invalid_credentials", "Invalid email or password")` response. (Existing code returns three distinct errors; this is a small change in the handler.)
+
+#### `SwitchInstituteCommand`
+
+```csharp
+if (tenant.IsTenantHost && request.InstituteId != tenant.InstituteId)
+    return Result.Failure<UseLoginDto>(
+        Error.Forbidden("SwitchInstitute", "Switching is not allowed on a tenant host"));
+```
+
+Inject `ITenantHostContext` into the handler.
+
+#### `AuthController.GetCurrentUser` (`/api/auth/me`)
+
+Add `TenantSlug` (string?) and `IsTenantHost` (bool) read from `ITenantHostContext`.
+
+### 7.7 Public branding endpoint
+
+`AMS.Api/Controllers/RestApi/PublicInstituteController.cs`:
+
+```csharp
+[ApiController]
+[Route("api/public/institutes")]
+[AllowAnonymous]
+public sealed class PublicInstituteController : PublicApiController
+{
+    [HttpGet("by-slug/{slug}/branding")]
+    public async Task<IActionResult> GetBranding(string slug, CancellationToken ct) =>
+        HandleResult(await Mediator.Send(new GetInstituteBrandingBySlugQuery(slug), ct));
+}
+```
+
+`GetInstituteBrandingBySlugQuery` returns `{ name, slug, logoUrl, accentColor, secondaryColor, tagline, isActive }`. 404 when slug unknown.
+
+### 7.8 CORS
+
+`AMS.Infrastructure/DependencyInjection.cs::AddCorsInternal` already calls `SetIsOriginAllowedToAllowWildcardSubdomains()`. Tweaks:
+
+- `appsettings.Production.json` `AllowedOrigins` becomes `["https://portal.classpass.lk", "https://*.classpass.lk"]`.
+- Optionally tighten with a `SetIsOriginAllowed(origin => …)` delegate that pings `IInstituteSlugResolver` for any non-portal subdomain, rejecting unknown slugs at the CORS layer too. (Defence-in-depth; the real protection is the host-vs-token check.)
+
+### 7.9 Forwarded headers
+
+`Program.cs` (insert before `app.UseAuthentication()`):
+
+```csharp
+var forwarded = new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor
+                    | ForwardedHeaders.XForwardedProto
+                    | ForwardedHeaders.XForwardedHost,
+    ForwardLimit = 2
+};
+foreach (var range in builder.Configuration.GetSection("Cloudflare:KnownNetworks").Get<string[]>() ?? [])
+    forwarded.KnownNetworks.Add(IPNetwork.Parse(range));
+app.UseForwardedHeaders(forwarded);
+```
+
+### 7.10 Acceptance
+
+- `curl https://api.classpass.lk/api/public/institutes/by-slug/inst-2026-0001/branding` → 200.
+- Login with `Host: royal-college.classpass.lk` issues a JWT whose `institute_id` matches that slug's institute (verify by decoding the token).
+- A JWT minted on `royal-college.classpass.lk` replayed with `Host: st-peters.classpass.lk` → 403 `tenant_token_mismatch`.
+- POST `/api/auth/switch-institute` on a tenant host → 403 `switch_not_allowed_on_tenant_host`.
+
+---
+
+## 8. Phase 3 — PWA tenant detection + branded sign-in
+
+### 8.1 Host detection
+
+`AMS.PWA/src/lib/tenant-host.ts`:
+
+```ts
+const ROOT_HOST = import.meta.env.VITE_ROOT_HOST as string;        // "classpass.lk"
+const ADMIN     = import.meta.env.VITE_ADMIN_SUBDOMAIN as string;   // "portal"
+
+export interface TenantHostInfo {
+  isTenantHost: boolean;   // false on portal / apex / localhost
+  isAdminHost: boolean;    // portal.classpass.lk
+  slug: string | null;     // the tenant slug or null
+}
+
+export function detectTenantHost(hostname = window.location.hostname): TenantHostInfo { … }
+```
+
+Localhost: returns `isAdminHost: true` so dev mirrors `portal` behaviour. To dev-test a tenant locally, set `VITE_DEV_TENANT_SLUG=royal-college` (a debug-only override read by `detectTenantHost`).
+
+### 8.2 Tenant provider
+
+`AMS.PWA/src/context/tenant-provider.tsx` wraps the app inside `main.tsx`. On boot:
+
+- If `!isTenantHost` → provide `null`, render children immediately.
+- Else fetch `/api/public/institutes/by-slug/{slug}/branding`.
+  - 200 + `isActive` → provide `{ slug, name, logoUrl, accentColor, … }`.
+  - 200 + `!isActive` → render full-page "This institute is inactive" with a link to `portal.classpass.lk`.
+  - 404 → render full-page "Institute not found".
+
+Expose `useTenant()` hook returning `TenantBranding | null`.
+
+### 8.3 Branded sign-in
+
+`AMS.PWA/src/features/auth/sign-in/index.tsx`:
+
+- If `useTenant()` is non-null, render a `<TenantBrand />` panel (logo + name + optional tagline) above the form.
+- Apply `accentColor` as CSS variable `--brand` on `<html data-tenant="…">` to recolour primary buttons in the auth flow.
+
+`AMS.PWA/src/features/auth/sign-in/components/user-auth-form.tsx`:
+
+- On tenant hosts: send `instituteSlug: tenant.slug` in the login body. Backend ignores body slug if host disagrees (host wins).
+- Skip the existing `/institutes/mine` + auto-switch fallback on tenant hosts — the JWT is already scoped.
+- Treat 401 / 403 generically: "Invalid email or password, or you are not a member of this institute" (matches the new backend parity).
+
+### 8.4 Auth store
+
+`AMS.PWA/src/stores/auth-store.ts` gains:
+
+```ts
+canSwitchInstitute: () => !detectTenantHost().isTenantHost
+```
+
+`switchInstitute` mutation hook returns a no-op when this is false.
+
+### 8.5 API client
+
+`AMS.PWA/src/lib/api-client.ts`: in the request interceptor, skip the `X-Institute-Id` header when `detectTenantHost().isTenantHost` (or always send it — backend ignores it on tenant hosts anyway; preference is to suppress for cleanliness).
+
+### 8.6 Switcher → badge
+
+`AMS.PWA/src/components/layout/app-sidebar.tsx`:
+
+```tsx
+{isTenantHost ? <InstituteBadge /> : <InstituteSwitcher />}
+```
+
+`InstituteBadge` is a new small read-only component that shows the tenant logo + name from `useTenant()`. The "Operate globally" affordance disappears with the switcher.
+
+### 8.7 Acceptance
+
+- Visit `https://royal-college.classpass.lk/sign-in` → see logo + name; sign in; land on `/` with switcher absent and accent applied.
+- Visit `https://portal.classpass.lk/sign-in` → unchanged generic flow with the switcher.
+- An unknown subdomain renders the "Institute not found" page.
+
+---
+
+## 9. Phase 4 — Sidebar & route gating
+
+### 9.1 Sidebar item schema
+
+`AMS.PWA/src/components/layout/types.ts`: extend `NavItem` with
+
+```ts
+requiredPermission?: string;   // e.g. "users:manage"
+requiredRole?: string;         // e.g. "SystemAdmin"
+visibleOnRootOnly?: boolean;   // hide on tenant subdomains
+```
+
+### 9.2 Filtering
+
+`AMS.PWA/src/components/layout/app-sidebar.tsx` uses a new `useSidebarData()` hook that:
+
+1. Loads `sidebarData.navGroups`.
+2. For each item: hide if `requiredPermission` set and `!auth.hasPermission(p)`; hide if `requiredRole` set and `!auth.hasRole(r)`; hide if `visibleOnRootOnly` and tenant host.
+3. Drops empty groups.
+
+### 9.3 Group restructure
+
+`AMS.PWA/src/components/layout/data/sidebar-data.ts` becomes:
+
+- **General** (universal): Dashboard, Class Rooms, Students, Instructors, Classes, NFC Cards, Attendance, Payments.
+- **Institute Administration**: Institute Settings, Institute Users (`requiredPermission: "institutes:view"`), Institute Roles (`requiredPermission: "institute-roles:manage"`), Notifications (`requiredPermission: "notifications:manage"`), Audit Logs.
+- **System Administration** (`visibleOnRootOnly: true`): Institutes (`requiredPermission: "institutes:view"`), Global Users (`requiredPermission: "users:manage"`), Global Roles (`requiredPermission: "roles:manage"`), Identity Review (`requiredRole: "GlobalIdentityAdmin"`).
+- **Settings** (universal, profile/account/etc.).
+
+### 9.4 Route guards
+
+- `AMS.PWA/src/routes/_global-admin/route.tsx`: extend `beforeLoad` to redirect to `/` when `detectTenantHost().isTenantHost`.
+- `AMS.PWA/src/routes/__root.tsx`: no change needed; the underlying route guard handles it.
+
+### 9.5 Acceptance
+
+- An institute-admin user on `royal-college.classpass.lk` sees only General + Institute Administration + Settings.
+- A SystemAdmin on `portal.classpass.lk` sees all four groups.
+- A SystemAdmin who navigates to `royal-college.classpass.lk` sees the same nav as the institute admin (system tabs hidden).
+
+---
+
+## 10. Phase 5 — Hosting cutover
+
+### 10.1 PWA → Cloudflare Pages
+
+- Delete `AMS.PWA/netlify.toml`.
+- Add `AMS.PWA/public/_redirects` with `/* /index.html 200`.
+- Create the Pages project, wire custom domains (Phase 0.3 / 0.1).
+- Run the new PWA against the existing API for one week before flipping DNS.
+
+### 10.2 API on `api.classpass.lk`
+
+- Replace `AMS.WIKI/deployment/ams-nginx.conf` with the API-only vhost.
+- Issue and install the `api.classpass.lk` cert via certbot DNS-01.
+- Update `AMS.WIKI/deployment/api.env.template`: add `Tenant__RootHostSuffix=classpass.lk`, `Tenant__AdminSubdomain=portal`, `Cloudflare__KnownNetworks__0=…` (one entry per published range).
+
+### 10.3 Decommission Netlify
+
+After 7 days of stable Pages traffic, delete the Netlify site.
+
+---
+
+## 11. Phase 6 — Onboarding UX
+
+### 11.1 Institute creation form
+
+`AMS.PWA/src/features/institutes/` — add a slug field with:
+
+- Live availability check `GET /api/institutes/check-slug?value=…` (system-admin only; returns `{ available, reason }` with `reason` ∈ `"taken" | "reserved" | "invalid"`).
+- Inline URL preview: `https://<slug>.classpass.lk`.
+- Client-side pre-validation against `AMS.PWA/src/lib/reserved-slugs.ts` (Phase 1.2).
+
+`CreateInstituteCommand` gains an optional `Slug`. If null, the handler defaults to `LOWER(code)`; if provided, validates and persists it.
+
+### 11.2 Slug change
+
+`UpdateInstituteCommand` (or a new `ChangeInstituteSlugCommand` for auditability) gates slug changes behind:
+
+- A PWA confirmation modal warning that existing tenant URLs / sessions will break.
+- A domain event (`InstituteSlugChangedEvent`) handled by the slug resolver to invalidate the cache.
+- An audit row in the existing audit infrastructure.
+
+### 11.3 Acceptance
+
+- Reserved slugs (`portal`, `api`, etc.) are rejected with a clear inline error.
+- Renaming an institute's slug invalidates the resolver cache within 1s.
+
+---
+
+## 12. Phase 7 — Azure-readiness audit *(do before any cutover)*
+
+Architectural guardrails so the VPS → Azure migration is config-only.
+
+- Every host/origin/storage/DB value flows through `IConfiguration`. No string literal pinning to VPS IPs.
+- `AllowedOrigins` already supports wildcards. `Tenant:RootHostSuffix` and `Tenant:AdminSubdomain` join the pattern.
+- Postgres connection string supports `SslMode=Require;Trust Server Certificate=true` toggle (Azure Flexible Server enforces SSL).
+- Logs: keep Seq via env var; add an Application Insights `TelemetryClient` registration behind an `Observability:UseApplicationInsights` flag.
+- Health: `/health` exists; add `/health/ready` and `/health/live` aliases for App Service / Container Apps probes.
+- Sticky sessions / in-memory state: none (already stateless). The `IMemoryCache` for slug resolution is process-local; that's fine because invalidation is event-driven per process (cache TTL caps staleness anyway).
+
+**Migration sequence (when ready):**
+
+1. Provision Azure DB for PostgreSQL Flexible Server; `pg_dump | pg_restore`.
+2. Deploy API to App Service / Container App with the same env vars.
+3. Cloudflare DNS: flip `api.classpass.lk` A record → App Service / Front Door hostname.
+4. Decommission VPS.
+
+The frontend on Cloudflare Pages is **not** affected.
+
+---
+
+## 13. Security model
+
+- Tenant subdomain ≠ authorisation. A user must already have an `InstituteUser` row for the host's institute (or hold `Institutes.AccessAny`). The host narrows scope; it never grants access.
+- JWT `institute_id` MUST equal `TenantHostContext.InstituteId` when the request is from a tenant host (Phase 2.5).
+- `X-Institute-Id` header is ignored on tenant hosts.
+- Switch-institute is server-rejected on tenant hosts.
+- Cookies are per-host by default (PWA `cookies.ts` does not set `Domain=`). A stolen cookie cannot move laterally between tenants.
+- Failed login on a tenant host returns the same error whether the email exists, the password is wrong, or the user isn't a member — no enumeration leak.
+
+---
+
+## 14. Risks & open items
+
+| Risk | Mitigation |
+|---|---|
+| Cookie scope regression | Audit any future `setCookie` change to confirm no `Domain=` attribute slips in. |
+| Reserved-slug drift between API + PWA | Mirror the list in `AMS.Domain.Constants.ReservedSlugs` and `AMS.PWA/src/lib/reserved-slugs.ts`; CI grep test asserting parity (`AMS.Tests` integration). |
+| Slug resolver cache invalidation across multiple API instances | Today: single-process VPS, no issue. On Azure scale-out: add a `IDistributedCache` (Redis) or rely on the 60s TTL. Document the limit. |
+| Cloudflare WebSocket proxying | Confirm any SSE/WebSocket feature works through Cloudflare's orange-cloud (notifications stream). |
+| Unknown-subdomain UX | Phase 3 tenant provider already renders a "Not found" screen. |
+| Backup access path | Keep the VPS IP reachable directly (`https://<vps-ip>` with a self-signed cert) for emergency support; documented in the runbook. |
+
+---
+
+## 15. Roll-forward order
+
+1. **Phase 1 — Domain/data** (smallest blast radius; everything else depends on `Slug`).
+2. **Phase 2 — API tenant resolution** (server-side complete; PWA still works on root host).
+3. **Phase 5 — Hosting cutover** to Cloudflare Pages on `portal.classpass.lk` only, before tenant subdomains exist.
+4. **Phase 3 — PWA tenant detection & branded sign-in** (now tenant URLs become real).
+5. **Phase 4 — Sidebar & route gating**.
+6. **Phase 6 — Onboarding UX**.
+7. **Phase 7 — Azure-readiness audit** (whenever the Azure decision lands).
 
 
 <div style="page-break-after: always;"></div>
@@ -4671,6 +6407,325 @@ The app works without internet:
 
 <div style="page-break-after: always;"></div>
 
+# 🧪 QA Test Data & Tracking Sheet
+
+> End-to-end manual testing dataset for QA — two full institutes with tracking columns
+
+**Purpose:** A ready-to-enter dataset for end-to-end manual testing of the whole system,
+covering **two full institutes** (tenants) with instructors, classrooms, subjects/grades,
+classes + fees, students + guardians, NFC cards, attendance and payments.
+
+**How to use this sheet**
+1. Work **top-to-bottom** — later entities reference IDs/codes created by earlier steps.
+2. Create each row, then fill in the **`✅ / Generated value`** column with the code or ID the
+   system returns (e.g. `INST-2026-0001`, `STU-2026-000123`, the GUID, the login it created).
+3. Use the **Notes** column for bugs / observations. If something can't be created, mark it ❌
+   and note why — that's a finding.
+4. Do **Institute A fully first**, then repeat for **Institute B** to confirm tenant isolation
+   (data from A must never appear under B's subdomain and vice-versa).
+
+**Environment**
+- Admin portal / tenant apps are served per-subdomain. Log into each institute at its own
+  subdomain (e.g. `https://royal-science.classpass.lk`, `https://bright-future.classpass.lk`).
+  In local dev without DNS, set `VITE_DEV_TENANT_SLUG` to the institute slug.
+- Currency is **LKR**. Phone numbers use the Sri Lankan format `+947XXXXXXXX`.
+- Codes marked *(auto)* are generated by the server — you do **not** type them; capture what
+  comes back.
+
+**Auto-generated code formats (for reference when verifying)**
+
+| Entity         | Format                | Example           |
+|----------------|-----------------------|-------------------|
+| Institute code | `INST-{year}-{0000}`  | `INST-2026-0001`  |
+| Person code    | `P-{year}-{000000}`   | `P-2026-000001`   |
+| Student code   | `STU-{year}-{000000}` | `STU-2026-000001` |
+| Employee code  | `EMP-{year}-{000000}` | `EMP-2026-000001` |
+
+---
+
+## 0. Global reference data (SystemAdmin — created once, shared by all institutes)
+
+Create these as **global** (no institute) so both tenants can reuse them. If your build only
+supports institute-scoped subjects/grades, create the equivalent rows inside each institute
+instead and note that.
+
+### 0.1 Global Subjects
+| #  | Name                 | Code  | Active | ✅ Created (ID) | Notes |
+|----|----------------------|-------|--------|----------------|-------|
+| S1 | Combined Mathematics | CMATH | Yes    |                |       |
+| S2 | Physics              | PHY   | Yes    |                |       |
+| S3 | Chemistry            | CHEM  | Yes    |                |       |
+| S4 | Biology              | BIO   | Yes    |                |       |
+| S5 | Mathematics          | MATH  | Yes    |                |       |
+| S6 | Science              | SCI   | Yes    |                |       |
+| S7 | English              | ENG   | Yes    |                |       |
+| S8 | ICT                  | ICT   | Yes    |                |       |
+| S9 | Accounting           | ACC   | Yes    |                |       |
+
+### 0.2 Global Grades
+| #  | Name           | Display Order | Active | ✅ Created (ID) | Notes |
+|----|----------------|---------------|--------|----------------|-------|
+| G1 | Grade 10       | 10            | Yes    |                |       |
+| G2 | Grade 11 (O/L) | 11            | Yes    |                |       |
+| G3 | A/L – Year 1   | 12            | Yes    |                |       |
+| G4 | A/L – Year 2   | 13            | Yes    |                |       |
+
+---
+
+# INSTITUTE A — Royal Science Academy (A/L focus, Colombo)
+
+## A.1 Institute
+| Field   | Value                          |
+|---------|--------------------------------|
+| Name    | Royal Science Academy          |
+| Slug    | `royal-science`                |
+| Code    | *(auto)* → capture: __________ |
+| Address | 123 Galle Road, Colombo 03     |
+| Phone   | +94112345678                   |
+| Email   | info@royalscience.lk           |
+
+**✅ Institute ID (GUID): ________________  Institute code: ________________**
+
+> After creation, confirm the tenant resolves at `royal-science.<root>` and that the sending of
+> `X-Tenant-Slug: royal-science` returns this institute's context.
+
+## A.2 Institute users (logins for this tenant)
+| #    | First  | Last      | Email                   | Role                 | ✅ Created / initial password | Notes                    |
+|------|--------|-----------|-------------------------|----------------------|------------------------------|--------------------------|
+| A-U1 | Anusha | Rajapaksa | admin@royalscience.lk   | Institute Admin      |                              | Full admin               |
+| A-U2 | Kasun  | Mendis    | cashier@royalscience.lk | Cashier / Front Desk |                              | Payments + card checking |
+
+> If accounts are provisioned with a system password (`MustChangePassword = true`), verify the
+> forced change-password screen appears on first login.
+
+## A.3 Classrooms
+| #    | Name        | Room Code | Capacity | Location     | ✅ Created (ID) | Notes |
+|------|-------------|-----------|----------|--------------|----------------|-------|
+| A-R1 | Main Hall   | RSA-H1    | 60       | Ground Floor |                |       |
+| A-R2 | Hall B      | RSA-H2    | 40       | 1st Floor    |                |       |
+| A-R3 | Science Lab | RSA-L1    | 30       | 2nd Floor    |                |       |
+
+## A.4 Instructors
+Codes are *(auto)*. `JoinDate` = 2026-01-05.
+
+| #    | First  | Last     | Email                          | Phone        | Gender | NIC          | Designation     | Qualification    | Subject taught | ✅ Employee code / User ID | Notes |
+|------|--------|----------|--------------------------------|--------------|--------|--------------|-----------------|------------------|----------------|---------------------------|-------|
+| A-I1 | Nimal  | Perera   | nimal.perera@royalscience.lk   | +94771000001 | Male   | 198012345678 | Senior Lecturer | BSc (Maths), MSc | Combined Maths |                           |       |
+| A-I2 | Kamala | Silva    | kamala.silva@royalscience.lk   | +94771000002 | Female | 198523456789 | Lecturer        | BSc (Physics)    | Physics        |                           |       |
+| A-I3 | Sunil  | Fernando | sunil.fernando@royalscience.lk | +94771000003 | Male   | 197834567890 | Lecturer        | BSc (Chemistry)  | Chemistry      |                           |       |
+
+## A.5 Classes
+Link each class to the instructor (`InstructorEmployment` id from A.4), a classroom, subject & grade.
+
+| #    | Name                    | Code     | Subject              | Grade        | Instructor  | Classroom   | Schedule        | Start      | ✅ Created (ID) | Notes |
+|------|-------------------------|----------|----------------------|--------------|-------------|-------------|-----------------|------------|----------------|-------|
+| A-C1 | A/L Combined Maths 2026 | RSA-CM01 | Combined Mathematics | A/L – Year 1 | A-I1 Nimal  | Main Hall   | Sat 08:00–11:00 | 2026-01-10 |                |       |
+| A-C2 | A/L Physics 2026        | RSA-PH01 | Physics              | A/L – Year 1 | A-I2 Kamala | Hall B      | Sun 08:00–11:00 | 2026-01-11 |                |       |
+| A-C3 | A/L Chemistry 2026      | RSA-CH01 | Chemistry            | A/L – Year 1 | A-I3 Sunil  | Science Lab | Sat 13:00–16:00 | 2026-01-10 |                |       |
+
+## A.6 Class fees
+| #    | Class               | Fee name                | Amount (LKR) | Frequency | Due day | ✅ Created (ID) | Notes |
+|------|---------------------|-------------------------|--------------|-----------|---------|----------------|-------|
+| A-F1 | A-C1 Combined Maths | Monthly tuition         | 3000         | Monthly   | 5       |                |       |
+| A-F2 | A-C1 Combined Maths | Registration (one-time) | 1000         | OneTime   | —       |                |       |
+| A-F3 | A-C2 Physics        | Monthly tuition         | 2800         | Monthly   | 5       |                |       |
+| A-F4 | A-C3 Chemistry      | Monthly tuition         | 2800         | Monthly   | 5       |                |       |
+
+## A.7 Students (+ guardians)
+Each student is enrolled to the institute with a primary guardian. Codes *(auto)*. Enrollment date = 2026-01-08.
+
+| #    | First    | Last           | DOB        | Gender | NIC          | Phone        | Email                 | Guardian name          | Guardian phone | Relationship | ✅ Student code / User ID | Notes                                                    |
+|------|----------|----------------|------------|--------|--------------|--------------|-----------------------|------------------------|----------------|--------------|--------------------------|----------------------------------------------------------|
+| A-S1 | Tharindu | Jayasuriya     | 2008-03-15 | Male   | 200807512345 | +94761000001 | tharindu.j@example.lk | Ranjan Jayasuriya      | +94771100001   | Father       |                          |                                                          |
+| A-S2 | Ashen    | Wickramasinghe | 2008-07-22 | Male   | 200820412346 | +94761000002 | ashen.w@example.lk    | Dilani Wickramasinghe  | +94771100002   | Mother       |                          |                                                          |
+| A-S3 | Nethmi   | Gunawardena    | 2009-01-05 | Female | 200900612347 | +94761000003 | nethmi.g@example.lk   | Sarath Gunawardena     | +94771100003   | Father       |                          |                                                          |
+| A-S4 | Sanduni  | Ratnayake      | 2008-11-30 | Female | 200833512348 | +94761000004 | sanduni.r@example.lk  | Kumari Ratnayake       | +94771100004   | Mother       |                          |                                                          |
+| A-S5 | Dilan    | Abeywardena    | 2008-05-18 | Male   | 200813912349 | +94761000005 | dilan.a@example.lk    | (student self-contact) | +94761000005   | Self         |                          | Test "Self" guardian / notification-preference = Student |
+
+## A.8 Class enrollments (student ↔ class)
+| #    | Student       | Class               | Status                   | ✅ Done | Notes                   |
+|------|---------------|---------------------|--------------------------|--------|-------------------------|
+| A-E1 | A-S1 Tharindu | A-C1 Combined Maths | Enrolled                 |        |                         |
+| A-E2 | A-S1 Tharindu | A-C2 Physics        | Enrolled                 |        | Student in 2 classes    |
+| A-E3 | A-S2 Ashen    | A-C1 Combined Maths | Enrolled                 |        |                         |
+| A-E4 | A-S3 Nethmi   | A-C2 Physics        | Enrolled                 |        |                         |
+| A-E5 | A-S3 Nethmi   | A-C3 Chemistry      | Enrolled                 |        |                         |
+| A-E6 | A-S4 Sanduni  | A-C3 Chemistry      | Enrolled                 |        |                         |
+| A-E7 | A-S5 Dilan    | A-C1 Combined Maths | Enrolled → then **Drop** |        | Test drop/withdraw flow |
+
+## A.9 NFC cards
+Issue a card to each student; test the full lifecycle. `IssuedBy` = the logged-in admin (A-U1).
+
+| #    | Student       | Card UID (hex) | Action to test                         | ✅ Card ID / final status | Notes                                        |
+|------|---------------|----------------|----------------------------------------|--------------------------|----------------------------------------------|
+| A-N1 | A-S1 Tharindu | 04A1B2C3D4     | Issue → Activate                       |                          | Normal active card                           |
+| A-N2 | A-S2 Ashen    | 04A1B2C3D5     | Issue → Activate → Block → Unblock     |                          |                                              |
+| A-N3 | A-S3 Nethmi   | 04A1B2C3D6     | Issue → Activate → Mark Lost → Replace |                          | Capture replacement card ID                  |
+| A-N4 | A-S4 Sanduni  | 04A1B2C3D7     | Issue (leave Pending)                  |                          | Test tap-in on a non-active card is rejected |
+
+## A.10 Attendance (via card tap / manual)
+| #    | Student       | Class | Date       | Method                  | Expected     | ✅ Done | Notes                        |
+|------|---------------|-------|------------|-------------------------|--------------|--------|------------------------------|
+| A-A1 | A-S1 Tharindu | A-C1  | 2026-01-10 | Card tap (A-N1)         | Present      |        |                              |
+| A-A2 | A-S2 Ashen    | A-C1  | 2026-01-10 | Card tap (A-N2)         | Present      |        |                              |
+| A-A3 | A-S3 Nethmi   | A-C2  | 2026-01-11 | Manual                  | Present      |        |                              |
+| A-A4 | A-S4 Sanduni  | A-C3  | 2026-01-10 | Card tap (A-N4 Pending) | **Rejected** |        | Should NOT record attendance |
+
+## A.11 Payments
+| #    | Student       | Class | Fee             | Amount (LKR)   | Method       | For month | Status to reach        | ✅ Receipt no. | Notes                                        |
+|------|---------------|-------|-----------------|----------------|--------------|-----------|------------------------|---------------|----------------------------------------------|
+| A-P1 | A-S1 Tharindu | A-C1  | Monthly tuition | 3000           | Cash         | Jan 2026  | Completed              |               | Print/verify receipt                         |
+| A-P2 | A-S1 Tharindu | A-C1  | Registration    | 1000           | Cash         | —         | Completed              |               | One-time fee                                 |
+| A-P3 | A-S2 Ashen    | A-C1  | Monthly tuition | 3000           | BankTransfer | Jan 2026  | Completed              |               | Add reference number                         |
+| A-P4 | A-S3 Nethmi   | A-C2  | Monthly tuition | 2800           | Card         | Jan 2026  | Completed              |               |                                              |
+| A-P5 | A-S3 Nethmi   | A-C2  | Monthly tuition | 2800           | Cash         | Feb 2026  | Completed → **Refund** |               | Test refund flow                             |
+| A-P6 | A-S4 Sanduni  | A-C3  | Monthly tuition | 1400 (partial) | Cash         | Jan 2026  | Completed              |               | Partial payment — verify outstanding balance |
+
+---
+
+# INSTITUTE B — Bright Future Academy (O/L focus, Kandy)
+
+## B.1 Institute
+| Field   | Value                          |
+|---------|--------------------------------|
+| Name    | Bright Future Academy          |
+| Slug    | `bright-future`                |
+| Code    | *(auto)* → capture: __________ |
+| Address | 45 Peradeniya Road, Kandy      |
+| Phone   | +94812223344                   |
+| Email   | info@brightfuture.lk           |
+
+**✅ Institute ID (GUID): ________________  Institute code: ________________**
+
+## B.2 Institute users
+| #    | First     | Last        | Email                   | Role                 | ✅ Created / initial password | Notes |
+|------|-----------|-------------|-------------------------|----------------------|------------------------------|-------|
+| B-U1 | Priyantha | Bandara     | admin@brightfuture.lk   | Institute Admin      |                              |       |
+| B-U2 | Iresha    | Dissanayake | cashier@brightfuture.lk | Cashier / Front Desk |                              |       |
+
+## B.3 Classrooms
+| #    | Name   | Room Code | Capacity | Location     | ✅ Created (ID) | Notes |
+|------|--------|-----------|----------|--------------|----------------|-------|
+| B-R1 | Room 1 | BFA-01    | 35       | Ground Floor |                |       |
+| B-R2 | Room 2 | BFA-02    | 25       | 1st Floor    |                |       |
+
+## B.4 Instructors
+`JoinDate` = 2026-01-03.
+
+| #    | First    | Last       | Email                      | Phone        | Gender | NIC          | Designation | Qualification | Subject taught | ✅ Employee code / User ID | Notes |
+|------|----------|------------|----------------------------|--------------|--------|--------------|-------------|---------------|----------------|---------------------------|-------|
+| B-I1 | Ruwan    | Ekanayake  | ruwan.e@brightfuture.lk    | +94772000001 | Male   | 198245678901 | Teacher     | BSc, Dip.Ed   | Mathematics    |                           |       |
+| B-I2 | Malini   | Herath     | malini.h@brightfuture.lk   | +94772000002 | Female | 198756789012 | Teacher     | BSc           | Science        |                           |       |
+| B-I3 | Chaminda | Rathnayake | chaminda.r@brightfuture.lk | +94772000003 | Male   | 199067890123 | Teacher     | BA (English)  | English        |                           |       |
+
+## B.5 Classes
+| #    | Name             | Code     | Subject     | Grade          | Instructor    | Classroom | Schedule        | Start      | ✅ Created (ID) | Notes |
+|------|------------------|----------|-------------|----------------|---------------|-----------|-----------------|------------|----------------|-------|
+| B-C1 | O/L Maths 2026   | BFA-MA01 | Mathematics | Grade 11 (O/L) | B-I1 Ruwan    | Room 1    | Mon 16:00–18:00 | 2026-01-06 |                |       |
+| B-C2 | O/L Science 2026 | BFA-SC01 | Science     | Grade 11 (O/L) | B-I2 Malini   | Room 1    | Wed 16:00–18:00 | 2026-01-08 |                |       |
+| B-C3 | O/L English 2026 | BFA-EN01 | English     | Grade 10       | B-I3 Chaminda | Room 2    | Fri 15:00–17:00 | 2026-01-09 |                |       |
+
+## B.6 Class fees
+| #    | Class        | Fee name        | Amount (LKR) | Frequency | Due day | ✅ Created (ID) | Notes                    |
+|------|--------------|-----------------|--------------|-----------|---------|----------------|--------------------------|
+| B-F1 | B-C1 Maths   | Monthly tuition | 2000         | Monthly   | 7       |                |                          |
+| B-F2 | B-C2 Science | Monthly tuition | 2000         | Monthly   | 7       |                |                          |
+| B-F3 | B-C3 English | Monthly tuition | 1800         | Monthly   | 7       |                |                          |
+| B-F4 | B-C1 Maths   | Term fee        | 5000         | Quarterly | 1       |                | Test Quarterly frequency |
+
+## B.7 Students (+ guardians)
+Enrollment date = 2026-01-05.
+
+| #    | First   | Last        | DOB        | Gender | NIC          | Phone        | Email                | Guardian name      | Guardian phone | Relationship | ✅ Student code / User ID | Notes                                |
+|------|---------|-------------|------------|--------|--------------|--------------|----------------------|--------------------|----------------|--------------|--------------------------|--------------------------------------|
+| B-S1 | Kavindu | Senanayake  | 2010-02-11 | Male   | 201004312350 | +94762000001 | kavindu.s@example.lk | Nadeeka Senanayake | +94772100001   | Mother       |                          |                                      |
+| B-S2 | Hasini  | Weerasinghe | 2010-06-19 | Female | 201017112351 | +94762000002 | hasini.w@example.lk  | Ajith Weerasinghe  | +94772100002   | Father       |                          |                                      |
+| B-S3 | Yasas   | Kumara      | 2011-09-03 | Male   | 201125012352 | +94762000003 | yasas.k@example.lk   | Shanika Kumara     | +94772100003   | Guardian     |                          | Relationship = Guardian (not parent) |
+| B-S4 | Oneli   | Pathirana   | 2010-12-25 | Female | 201035912353 | +94762000004 | oneli.p@example.lk   | Rohan Pathirana    | +94772100004   | Father       |                          |                                      |
+
+> **Cross-tenant test:** Try to enroll **B-S1 Kavindu** using the same NIC/phone that already
+> exists for an Institute A student — verify the system treats them per-tenant and/or surfaces
+> the identity-match / person-code linking flow correctly. Record behaviour in Notes.
+
+## B.8 Class enrollments
+| #    | Student      | Class        | Status   | ✅ Done | Notes |
+|------|--------------|--------------|----------|--------|-------|
+| B-E1 | B-S1 Kavindu | B-C1 Maths   | Enrolled |        |       |
+| B-E2 | B-S1 Kavindu | B-C2 Science | Enrolled |        |       |
+| B-E3 | B-S2 Hasini  | B-C1 Maths   | Enrolled |        |       |
+| B-E4 | B-S2 Hasini  | B-C3 English | Enrolled |        |       |
+| B-E5 | B-S3 Yasas   | B-C2 Science | Enrolled |        |       |
+| B-E6 | B-S4 Oneli   | B-C3 English | Enrolled |        |       |
+
+## B.9 NFC cards
+| #    | Student      | Card UID (hex) | Action to test                | ✅ Card ID / final status | Notes |
+|------|--------------|----------------|-------------------------------|--------------------------|-------|
+| B-N1 | B-S1 Kavindu | 05B1C2D3E4     | Issue → Activate              |                          |       |
+| B-N2 | B-S2 Hasini  | 05B1C2D3E5     | Issue → Activate              |                          |       |
+| B-N3 | B-S3 Yasas   | 05B1C2D3E6     | Issue → Activate → Deactivate |                          |       |
+
+> **Tenant-isolation test:** Try to tap **A-N1** (Institute A card) at Institute B's checker —
+> it must be rejected / not found. Record result.
+
+## B.10 Attendance
+| #    | Student      | Class | Date       | Method          | Expected | ✅ Done | Notes                   |
+|------|--------------|-------|------------|-----------------|----------|--------|-------------------------|
+| B-A1 | B-S1 Kavindu | B-C1  | 2026-01-06 | Card tap (B-N1) | Present  |        |                         |
+| B-A2 | B-S2 Hasini  | B-C1  | 2026-01-06 | Card tap (B-N2) | Present  |        |                         |
+| B-A3 | B-S3 Yasas   | B-C2  | 2026-01-08 | Manual          | Present  |        |                         |
+| B-A4 | B-S4 Oneli   | B-C3  | 2026-01-09 | Manual          | Late     |        | Test non-Present status |
+
+## B.11 Payments
+| #    | Student      | Class | Fee             | Amount (LKR) | Method       | For month | Status to reach | ✅ Receipt no. | Notes                          |
+|------|--------------|-------|-----------------|--------------|--------------|-----------|-----------------|---------------|--------------------------------|
+| B-P1 | B-S1 Kavindu | B-C1  | Monthly tuition | 2000         | Cash         | Jan 2026  | Completed       |               |                                |
+| B-P2 | B-S1 Kavindu | B-C2  | Monthly tuition | 2000         | Online       | Jan 2026  | Completed       |               | Test Online method + reference |
+| B-P3 | B-S2 Hasini  | B-C1  | Monthly tuition | 2000         | Cash         | Jan 2026  | Completed       |               |                                |
+| B-P4 | B-S3 Yasas   | B-C2  | Monthly tuition | 2000         | Cash         | Jan 2026  | Completed       |               |                                |
+| B-P5 | B-S4 Oneli   | B-C3  | Term fee        | 5000         | BankTransfer | Q1 2026   | Completed       |               | Quarterly fee                  |
+
+---
+
+## Cross-cutting / negative tests (do after both institutes exist)
+
+| #   | Test                                                                               | Expected                     | ✅ Result | Notes                                    |
+|-----|------------------------------------------------------------------------------------|------------------------------|----------|------------------------------------------|
+| X1  | Log into `royal-science`, confirm you see **only** Institute A students/classes    | No Institute B data visible  |          | Tenant isolation                         |
+| X2  | Log into `bright-future`, confirm you see **only** Institute B data                | No Institute A data visible  |          |                                          |
+| X3  | Duplicate slug — create a 3rd institute with slug `royal-science`                  | Rejected (already taken)     |          |                                          |
+| X4  | Reserved slug — try slug `www`, `admin`, `portal`, `api`                           | Rejected (reserved)          |          |                                          |
+| X5  | Invalid slug — `AB`, `1abc`, `abc-`, `has space`                                   | Rejected (validation)        |          | Must be 3–40, lowercase, start w/ letter |
+| X6  | Duplicate card UID — issue `04A1B2C3D4` again                                      | Rejected (UID in use)        |          |                                          |
+| X7  | Enroll student into the same class twice                                           | Rejected / no duplicate      |          |                                          |
+| X8  | Payment amount = 0 or negative                                                     | Rejected                     |          |                                          |
+| X9  | Cashier user (A-U2) tries an admin-only action (e.g. delete institute)             | Forbidden (403)              |          | Permission check                         |
+| X10 | Soft delete a student, then confirm they disappear from lists but data is retained | Hidden, not hard-deleted     |          |                                          |
+| X11 | Deactivate Institute A, attempt tenant login                                       | Blocked / handled gracefully |          |                                          |
+
+---
+
+## Summary tracker (fill in totals when done)
+
+| Entity             | Institute A target | Institute A done | Institute B target | Institute B done |
+|--------------------|--------------------|------------------|--------------------|------------------|
+| Institute          | 1                  |                  | 1                  |                  |
+| Institute users    | 2                  |                  | 2                  |                  |
+| Classrooms         | 3                  |                  | 2                  |                  |
+| Instructors        | 3                  |                  | 3                  |                  |
+| Classes            | 3                  |                  | 3                  |                  |
+| Class fees         | 4                  |                  | 4                  |                  |
+| Students           | 5                  |                  | 4                  |                  |
+| Guardians          | 5                  |                  | 4                  |                  |
+| Class enrollments  | 7                  |                  | 6                  |                  |
+| NFC cards          | 4                  |                  | 3                  |                  |
+| Attendance records | 4                  |                  | 4                  |                  |
+| Payments           | 6                  |                  | 5                  |                  |
+
+**Tester:** ________________   **Build / commit:** ________________   **Date:** ____________
+
+
+<div style="page-break-after: always;"></div>
+
 # 👨‍🎓 Student Guide
 
 > How to use the AMS Student Portal
@@ -5488,6 +7543,210 @@ interface PendingAttendance {
 
 **Previous:** [NFC Card Management](./nfc-card-management.md) | **Next:** [Fee Management](./fee-management.md)
 
+
+
+<div style="page-break-after: always;"></div>
+
+# 📦 Card Inventory & Provisioning Module
+
+> Platform-controlled NFC card stock: only cards ClassPass supplies can be issued to students.
+
+## 1. Why this exists
+
+Institutes must not be able to use arbitrary NFC tags (cheap clones, random cards) with the
+system. ClassPass manufactures and ships physical cards to each institute; the platform
+pre-registers those card UIDs. Issuing a card to a student (see the
+[NFC Card Management](nfc-card-management.md) module) only succeeds when the scanned UID is a
+**registered** card that isn't already in use. **Registration is the gate** — there is no manual
+per-institute allocation step. The physical handover of the cards is the control: an institute
+simply starts issuing the cards it was given.
+
+This separates two concerns that used to be one:
+
+| Concept | Aggregate | Owner | Meaning |
+|---|---|---|---|
+| **Inventory** | `CardStock` | Platform (SystemAdmin) | A physical card we manufactured and registered |
+| **Issuance** | `NfcCard` | Institute admin | A card that has been issued to a student enrollment |
+
+## 2. CardStock lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Available: Register (platform)
+    Available --> Assigned: Assign (issued to a student — claims the card for that institute)
+    Assigned --> Available: Release (issued card deactivated)
+    Available --> Retired: Retire
+    Assigned --> Retired: Lost / Replaced (issued card)
+    Retired --> Available: Reinstate (platform)
+```
+
+- **Available** — registered and free to issue. Not currently on a student, not owned by any institute.
+- **Assigned** — currently on a student, linked to an `NfcCard` and the institute that claimed it.
+- **Retired** — out of circulation (lost/damaged). Reversible: a retired card can be **reinstated**
+  back to `Available`.
+
+## 3. Provisioning workflow (platform / SystemAdmin)
+
+1. **Register** the cards we manufactured. Three ways, all on *Platform → Card Inventory*
+   (`/admin/card-stock`):
+   - **Register card** — type a single UID.
+   - **Scan cards** — tap cards on a Web NFC reader; each tap registers the card instantly so a
+     whole stack can be added in seconds.
+   - **Bulk import** — paste/CSV a list of UIDs.
+   All three accept an optional `BatchCode` (e.g. the shipment box) for inventory tracking;
+   invalid and already-registered UIDs are skipped and reported.
+2. **Hand the physical cards to the institute.** No system step — the institute starts issuing.
+3. **Retire** damaged cards as needed. A card currently `Assigned` to a student cannot be retired
+   directly — the issued card must be marked lost or replaced first. A retired card that turns out
+   to be usable again can be **Reinstated** back to `Available` from the same screen.
+
+## 4. Issuance enforcement & claim-on-first-use
+
+`IssueCardCommand` looks up the scanned UID in `CardStock` (a global lookup — `CardStock` has no
+tenant query filter) and rejects when:
+
+| Condition | Result |
+|---|---|
+| UID not found | `404` — "not supplied by ClassPass" |
+| Stock is `Retired` | `400` — card retired |
+| Stock is `Assigned` | `409` — already on a student |
+| Stock is `Available` | ✅ issue, then `stock.Assign(card.Id, instituteId)` → **Assigned**, claiming the card for the caller's institute |
+
+Because the UID is globally unique and a card flips to `Assigned` the moment it is issued, a card
+can never be on two students at once, and no other institute can reuse a card that is in service.
+A registered-but-unclaimed card is claimed by whichever institute issues it first — which in
+practice is the institute physically holding it.
+
+Knock-on lifecycle from issued-card operations:
+
+- **Deactivate** issued card → `stock.Release()` returns it to the free pool (`Available`).
+- **Mark lost** → `stock.Retire()` (out of circulation; can be reinstated later if recovered).
+- **Replace** → new card's stock `Assign`ed, old card's stock `Retire`d.
+
+## 5. Permissions
+
+The inventory is platform-only. Its permissions are **SystemAdmin-only** system permissions
+(excluded from the tenant `Admin` role so a tenant admin cannot register or retire the cards we
+supply):
+
+- `card-stock:view` — view inventory
+- `card-stock:register` — register single / scan / bulk
+- `card-stock:manage` — retire / reinstate / manage
+
+Institute admins continue to use `cards:view` / `cards:issue`; the registration gate is enforced
+server-side in `IssueCardCommand`, so no institute-facing inventory endpoint is required.
+
+## 6. Persistence
+
+Table `ams_card_stock` (`public` schema): unique index on `card_uid`, plus indexes on
+`(institute_id, status)` and `batch_code`. Optional FK to `ams_institutes` (`Restrict`);
+`institute_id` is set only while a card is `Assigned`.
+
+
+<div style="page-break-after: always;"></div>
+
+# Document & Media Storage
+
+NFC-based attendance is multi-tenant: many institutes share one deployment. Every
+uploaded file — institute logos, user profile pictures, and general documents — is
+stored in **Azure Blob Storage** with **hard per-tenant isolation**.
+
+## Goals
+
+- An institute's files live **only** in that institute's own container.
+- The storage account stays **fully private** ("allow blob public access" can be OFF).
+  Logos shown on the **anonymous sign-in page** are served via short-lived read **SAS
+  URLs**; everything else streams through the authenticated content proxy.
+- File access is deterministic (no fragile URL parsing) and always re-checks the
+  caller's tenant before returning bytes.
+
+## Blob layout
+
+```
+inst-{instituteId}/                 ← private, ONE container per institute
+    users/{userId}/profile/{date}/{guid}_name.jpg      (+ /thumbnails/)
+    users/{userId}/documents/{date}/{guid}_name.pdf
+    students/{studentId}/documents/...
+    docket/{docketId}/...
+    institute/documents/...
+branding/                           ← public-read, shared
+    {instituteId}/logo/{date}/{guid}_logo.png
+platform/                           ← private, platform/system assets
+    templates/... | defaults/...
+```
+
+- Container names use the **immutable institute Id** (`inst-{guid:N}`, 37 chars) — not
+  the mutable slug — so renaming an institute never strands its blobs. Azure container
+  rules (3–63 chars, lowercase alphanumeric + hyphen) are satisfied.
+- The container + relative blob path are stored on each `Document` row
+  (`ContainerName`, `Path`), so download/delete never have to parse a URI.
+
+## Access model
+
+Every container is **private**. Nothing relies on public blob access.
+
+| Asset | Container | How it's served |
+|-------|-----------|-----------------|
+| Institute logo | `branding` | Raw blob URL saved to `Institute.LogoUrl`; **signed into a read SAS URL** by `IBlobUrlSigner` whenever a DTO exposes it (branding endpoint, institute detail, switcher, list). Pre-auth friendly — the token is in the URL. |
+| Profile picture | `inst-{id}` | Authenticated proxy `GET /api/documents/{id}/content` |
+| General document | `inst-{id}` | Authenticated proxy `GET /api/documents/{id}/content` |
+| Platform asset | `platform` | Authenticated proxy |
+
+### SAS signing
+
+`IBlobUrlSigner` / `BlobUrlSigner` generates a read-only service SAS (default 24h TTL)
+from the account's shared-key credential — i.e. the `AzureBlobStorage` connection string
+must include `AccountKey`. The stored `Institute.LogoUrl` is always the **raw** blob URL;
+it's re-signed on every read so SAS expiry never strands a stored value. If the client
+lacks a shared-key credential (managed identity / SAS connection string), signing is
+skipped and the raw URL is returned (works only if the container is public) — logged as a
+warning. For that setup, switch to user-delegation SAS.
+
+> The institute logo is managed only via `POST /api/institutes/{id}/logo`. Editing
+> institute details (`PUT /api/institutes/{id}`) never touches the logo.
+
+## Tenant isolation enforcement
+
+`ContainerStrategyService.GetContainerName` **throws** if a tenant-scoped category is
+requested without an institute id. `DocumentService`:
+
+- Resolves the target institute from `IInstituteContext` (or an explicit, authorized id).
+- Rejects cross-tenant writes and reads — only a caller acting inside the document's
+  institute (or a holder of `institutes:access-any`) may touch it.
+
+## Key components
+
+- **`IContainerStrategyService` / `ContainerStrategyService`** — container + path rules.
+- **`IDocumentStorageService` / `DocumentStorageService`** — Azure Blob I/O, container
+  access levels, thumbnail generation, best-effort thumbnail cleanup on delete.
+- **`IDocumentService` / `DocumentService`** — orchestrates validation, tenant
+  resolution, persistence, and the content proxy.
+- **`Document`** entity — `InstituteId`, `OwnerType`, `OwnerId`, `ContainerName`,
+  relative `Path`, nullable `DocketId`.
+
+## API surface
+
+| Method | Route | Auth | Purpose |
+|--------|-------|------|---------|
+| POST | `/api/institutes/{id}/logo` | `institutes:update` | Upload/replace logo (replaces old blob) |
+| GET | `/api/public/institutes/by-slug/{slug}/branding` | anonymous | Branding (logo URL) for the sign-in page |
+| POST | `/api/account/profile-picture` | authenticated | Upload/replace own avatar |
+| GET | `/api/account/profile-picture` | authenticated | Avatar reference (proxy URL) |
+| GET | `/api/account/profile-picture/content` | authenticated | Stream own avatar bytes |
+| DELETE | `/api/account/profile-picture` | authenticated | Remove own avatar |
+| POST | `/api/documents/upload` | `documents:upload` | Upload a document (owner-scoped) |
+| GET | `/api/documents/{id}` | `documents:view` | Document metadata |
+| GET | `/api/documents/{id}/content` | `documents:download` | Stream document bytes (proxy) |
+| DELETE | `/api/documents/{id}` | `documents:delete` | Archive a document |
+
+`AuthMeDto.ProfilePictureUrl` carries the avatar proxy URL so the PWA can render it at
+bootstrap; it is resolved live (the avatar can change after the JWT is minted).
+
+## Per-category upload rules
+
+Size limits, allowed extensions and MIME types, and thumbnail generation are defined per
+`DocumentCategory` in `CategoryUploadSettings`. Logos: ≤2 MB, `jpg/png/svg/webp`.
+Profile pictures: ≤2 MB, `jpg/png`, thumbnailed (200×200).
 
 
 <div style="page-break-after: always;"></div>
@@ -6727,6 +8986,155 @@ sequenceDiagram
 
 <div style="page-break-after: always;"></div>
 
+# 👩‍🏫 Instructor Portal Module
+
+> Self-service portal where instructors log in and see **only their own** classes, students,
+> attendance, student fee status, and revenue-share earnings.
+
+## 1. Module Overview
+
+Institutes employ instructors who need visibility into the classes they teach without being
+given institute-wide admin access. The Instructor Portal is a permission-gated area of the same
+authenticated web app (the PWA) that shows each instructor a personalised view:
+
+- **My Dashboard** — class/student counts, today's sessions, this month's earnings.
+- **My Classes** — the classes they're assigned to, with schedule and enrolment counts.
+- **Class detail** — tabbed **Roster**, **Attendance** (mark/correct), and **Fees** (read-only).
+- **My Earnings** — their own revenue-share payouts, with a trailing-months history.
+
+The whole surface is **self-scoped**: every API call resolves the caller's own
+`InstructorEmployment` server-side and only returns data for the classes that instructor
+teaches. There is no instructor-id parameter, so one instructor can never read another's data.
+
+## 2. Data Model (reused)
+
+No new tables. The portal sits on top of existing entities:
+
+| Entity | Role |
+| --- | --- |
+| `InstructorEmployment` | Links a `User` to an `Institute` as an instructor. |
+| `InstructorClass` | Assigns an instructor to a `Class` (active/primary). |
+| `StudentClass` | Enrolment used for the roster and fee status. |
+| `ClassSession` | Weekly schedule shown on the dashboard / class detail. |
+| `Attendance` | Read for the sheet; created/updated when marking. |
+| `RevenueShareConfig` / `PaymentAllocation` | Drive the earnings figures. |
+
+## 3. Onboarding & Credentials
+
+When an instructor is employed via a **brand-new person** (`EmployInstructorCommand` Person path):
+
+- **Email and NIC are mandatory** (`EmployInstructorCommandValidator`). The email becomes the login
+  username; the NIC seeds the initial password.
+- The new account gets a **system-generated initial password** `{NIC}@{Firstname}` (first name
+  title-cased) — see `InstructorInitialPassword.Build`. It's predictable on purpose so an admin can
+  hand it over, never a lasting secret.
+- The account is flagged `ApplicationUser.MustChangePassword`, so the instructor is **forced to
+  change the password on first login**. The PWA's `_authenticated` route gate redirects to a
+  full-screen `/change-password` page until the flag clears (cleared by `ChangePasswordCommand`).
+
+Linking an **existing** person (by `UserId` / `PersonCode`) reuses their account and credentials
+untouched — no email/NIC requirement and no password reset.
+
+### Institute membership (login access)
+
+Logging in requires an active `InstituteUser` row (the membership/role record the login guard and
+JWT permissions are built from):
+
+- **Instructors are auto-linked.** `EmployInstructorCommandHandler.EnsureInstituteMembershipAsync`
+  creates an `InstituteUser` bound to the seeded **Instructor** role (which carries `portal:*`) plus
+  the baseline global `User` role — idempotent, so an existing membership/role is never overwritten.
+  Without this an employed instructor could not actually sign into the portal.
+- **Students are on-demand, not automatic.** Enrolling a student does **not** create login access
+  (least-privilege; there's no student portal yet). An admin grants it per student via the Students
+  list → **Grant institute access** action, which calls `POST /api/institutes/{id}/users/existing`
+  (`AddUserToInstituteCommand`, gated by `institute-users:create`) with the seeded **Student** role.
+  The same command also backs the legacy super-admin `POST /users` endpoint.
+
+The `AddStudentRoleAndInstructorMembershipBackfill` migration seeds the Student role into existing
+institutes and backfills `InstituteUser(Instructor)` rows for instructor employments that predate
+the auto-link.
+
+## 4. Permissions
+
+The seeded **`Instructor`** institute role carries a dedicated self-scoped permission set
+(`DefaultInstituteRolePermissions.InstructorPermissions`) instead of the institute-wide
+`students:view` / `classes:view`:
+
+| Permission | Grants |
+| --- | --- |
+| `portal:access` | Use the portal; land on the dashboard. |
+| `portal:classes:view` | List own classes + class detail. |
+| `portal:students:view` | View the roster of own classes. |
+| `portal:attendance:view` | View attendance for own class sessions. |
+| `portal:attendance:mark` | Mark/correct attendance for own class sessions. |
+| `portal:payments:view` | Read-only fee status of students in own classes. |
+| `portal:revenue:view` | View own revenue-share earnings. |
+
+These are eligible for the per-institute assignable boundary (`InstitutePermissionPolicy`,
+resource `portal`), so institute admins can grant them to custom roles. Because admins lack
+`portal:*` and instructors lack the broad admin permissions, the "My Teaching" sidebar group
+and the admin sections never overlap.
+
+## 5. API — `/api/portal/*`
+
+All endpoints extend `BaseApiController` and are gated by the matching `portal:*` policy.
+Ownership is enforced by `ICurrentInstructorResolver` (`GetCurrentAsync` / `GetForClassAsync`).
+
+| Method & route | Permission | Returns |
+| --- | --- | --- |
+| `GET /api/portal/me` | `portal:access` | The instructor's own profile. |
+| `GET /api/portal/dashboard` | `portal:access` | Dashboard metrics + today's sessions. |
+| `GET /api/portal/classes` | `portal:classes:view` | Classes the instructor teaches. |
+| `GET /api/portal/classes/{classId}` | `portal:classes:view` | Class detail: sessions + fees + revenue split. |
+| `GET /api/portal/classes/{classId}/students` | `portal:students:view` | Roster. |
+| `GET /api/portal/classes/{classId}/attendance?date=` | `portal:attendance:view` | Attendance sheet for a date. |
+| `POST /api/portal/classes/{classId}/attendance` | `portal:attendance:mark` | Upsert attendance for a date. |
+| `GET /api/portal/classes/{classId}/fee-status?year=&month=` | `portal:payments:view` | Read-only class fee status. |
+| `GET /api/portal/earnings?year=&month=` | `portal:revenue:view` | The instructor's payout for a month. |
+| `GET /api/portal/earnings/history?months=` | `portal:revenue:view` | Trailing-months payout history. |
+
+Several handlers reuse existing admin queries after the ownership check — `GetClassStudentsQuery`,
+`GetClassFeeStatusQuery`, and `GetInstructorPayoutQuery` — so portal data stays consistent with
+the admin views.
+
+## 6. Frontend
+
+Lives in the existing authenticated shell (same sidebar/header/theming):
+
+- Routes: `src/routes/_authenticated/portal/**` (dashboard, classes, classes/$classId, earnings).
+- Feature: `src/features/portal/**` (dashboard, my-classes, class-detail with tabs, attendance
+  sheet, fee-status panel, earnings).
+- Data: `src/services/portal.service.ts` + `src/hooks/use-portal.ts` (TanStack Query).
+- Nav: a permission-gated **"My Teaching"** group in `sidebar-data.ts`.
+- Landing: `_authenticated/index.tsx` redirects instructor-only users to `/portal`.
+
+## 7. Deployment Notes
+
+Three migrations ship with this module:
+- `AddInstructorPortalPermissions` — seeds the `portal:*` permission rows, swaps the broad
+  permissions on every existing `Instructor` institute role for the `portal:*` set, and adds them to
+  each institute's assignable boundary.
+- `AddMustChangePassword` — adds the `MustChangePassword` column to `ams_application_users`.
+- `AddStudentRoleAndInstructorMembershipBackfill` — seeds the `Student` institute role into existing
+  institutes and backfills `InstituteUser(Instructor)` membership for pre-existing instructor employments.
+
+Run the API once with `--seed-permissions` after deploy so the global permission catalogue is reconciled.
+
+## 8. Tests
+
+`AMS.Tests/Portal/`, `AMS.Tests/Instructor/` and `AMS.Tests/Institute/` cover the security spine and
+onboarding contracts:
+- `CurrentInstructorResolverTests` — non-instructors and non-owned classes are rejected (Forbidden).
+- `InstructorPortalRoleTests` — the Instructor role carries `portal:*` and **not** institute-wide perms.
+- `MarkMyClassAttendanceCommandValidatorTests` — marking input validation.
+- `EmployInstructorCommandValidatorTests` — email + NIC required for a new instructor; not for an existing one.
+- `InstructorInitialPasswordTests` — `{NIC}@{Firstname}` format satisfies the Identity password policy.
+- `DefaultInstituteRoleTests` — `Student` is a seeded system role with no management permissions; `Instructor` carries `portal:access`.
+- `AddUserToInstituteCommandValidatorTests` — add-existing-member input validation.
+
+
+<div style="page-break-after: always;"></div>
+
 # 💳 NFC Card Management Module
 
 > NFC card provisioning, validation, and lifecycle management for AMS
@@ -7379,6 +9787,209 @@ graph LR
 
 **Previous:** [Institute Management](./institute-management.md) | **Next:** [Attendance Module](./attendance-module.md)
 
+
+
+<div style="page-break-after: always;"></div>
+
+# 📡 Notification Channels — Current State & Industry-Standard Evaluation
+
+> A grounded assessment of how AMS actually sends notifications today, how that compares to
+> industry practice for SMS and email, and a phased plan to close the gap. This complements the
+> aspirational design in [Notification Service](./notification-service.md) — that document
+> describes a target; this one describes **what the code does right now** and what to build next.
+
+## 0. Status & chosen providers (Phases 1–5 shipped)
+
+The delivery gap below has been closed across five phases. Phase 1 (foundation):
+
+- **Providers shipped:** **email** — **Resend** (free to 3k/mo, clean REST API + webhooks) and
+  **turboSMTP** (`POST /api/v2/mail/send`, `consumerKey`/`consumerSecret`); **SMS** (Sri-Lanka) —
+  **SMSlenz.lk** (`POST /api/send-sms`) and **Text.lk** (`POST /api/v3/sms/send`). All register as
+  `INotificationSender` (each carries `Provider`/`DisplayName`/`IsConfigured`); the **active provider
+  per channel is chosen at runtime** (see Phase 5), not at DI time.
+  Config: `Resend:*`, `TurboSmtp:*`, `SmsLenz:*`, `TextLk:*`, `Notifications:*`, `Fcm:*` in
+  `appsettings` (secrets via user-secrets/env; `Sms:Provider` is only the initial default).
+
+- **Phase 5 (admin-managed providers) shipped:** the active email/SMS service is a persisted
+  platform setting (`SystemSetting` `notifications.provider.{email,sms}`), resolved per dispatch by
+  `INotificationSenderResolver` (falls back to any configured sender if the choice is unset/
+  unconfigured). System admins manage it at `GET/PUT /api/notifications/providers`
+  (`system:settings:manage`) and the PWA **Settings → Notification Services** page — an expandable
+  per-channel panel showing the active provider, a provider switcher (un-configured ones disabled),
+  and **messages sent this month** overall and per provider (`Notification.Provider` is stamped on
+  send; counts via `CountSinceAsync`/`CountByProviderSinceAsync`).
+- **Provider abstraction + outbox worker shipped:** `INotificationSender` per channel
+  (`ResendEmailSender`, `TextLkSmsSender`, typed `HttpClient`s) drained by
+  `NotificationDispatchWorker` (`AMS.Infrastructure/BackgroundServices/`), which dispatches
+  `Pending`/retryable rows and transitions status with `RetryCount` backoff. Opt-in via
+  `Notifications:DispatchEnabled` (off in dev/CI).
+- **Per-institute configurability shipped:** `ams_institute_notification_settings` (event×channel
+  matrix) + `INotificationPolicy`, which gates every send against the platform kill-switch, the
+  institute matrix, and the recipient's opt-out (`UserPreference.Notifications`). Managed at
+  `GET/PUT /api/notifications/settings` (`notifications:manage`) and the PWA **Settings →
+  Institute Notifications** page.
+
+**Phase 2 (event triggers) shipped:** business events auto-enqueue through a reusable
+`INotificationTrigger` (fans out to email + SMS; the policy/resolver decide what is actually
+queued). Wired: **fee paid** (`RecordPaymentCommand` → `PaymentConfirmation`), **low attendance**
+(`LowAttendanceAlertWorker` → `Attendance`, replacing its old direct InApp write), **card
+blocked/expired/replaced** (`BlockCardCommand`, `CardExpiryWorker`, `ReplaceCardCommand` →
+`CardStatus`), and **fee reminders/overdue** (`PaymentReminderWorker` — a daily scan that nudges
+unpaid students a few days before each Monthly fee's due day and again after, once each per month
+via exact-day matching). `SendUserNotificationCommand` takes an explicit `InstituteId` so
+worker/trigger callers gate against the right institute matrix.
+
+**Phase 3 (delivery receipts + governance) shipped:** notifications carry the provider message id
+(`provider_message_id`) captured on send; `POST /api/webhooks/notifications/{resend,textlk}`
+(shared-secret guarded, anonymous) map provider events to `MarkAsDelivered`/`MarkAsFailed`
+idempotently via `RecordNotificationDeliveryCommand` (Resend, turboSMTP, SMSlenz, and Text.lk endpoints).
+The dispatch worker now honours **quiet
+hours** (defers SMS in a configured window) and a **per-institute per-tick rate cap**
+(`institute_id` is persisted on each notification).
+
+**Phase 4 (channels) shipped:** `InAppNotificationSender` (the stored row is the in-app delivery)
+and `PushNotificationSender` (FCM legacy HTTP behind `Fcm:ServerKey`) round out all four
+`NotificationChannel` values; both are registered and selected by the dispatch worker.
+
+**Still external / future:** SMSlenz **Sender-ID registration** + live `user_id`/`api_key` (and
+Resend domain verification) are operational steps, not code. The SMSlenz delivery-report webhook
+(`POST /api/webhooks/notifications/smslenz`, correlating on `campaign_id`) ships, but its exact
+payload field names should be confirmed against the SMSlenz dashboard's callback settings. Production should add Resend **Svix HMAC**
+signature verification alongside the shared-secret check, migrate push to **FCM HTTP v1**
+(OAuth2), and add message **templating + Sinhala/Tamil/English i18n** (the senders currently send
+the trigger's plain content). Reminder scanning covers **Monthly** fees with a due day.
+
+## 1. Contact resolution & the per-enrollment preference
+
+Every outbound message is addressed by `StudentContactResolver`
+(`AMS.Infrastructure/Services/Identity/StudentContactResolver.cs`), which turns a `userId` +
+`NotificationChannel` into a concrete recipient. Many students (especially younger ones) have no
+email or phone of their own, so the resolver falls back to a linked guardian.
+
+Each enrollment now carries a **notification-contact preference**
+(`StudentEnrollment.NotificationContactPreference`, column `notification_contact_preference`):
+
+| Preference | Behaviour |
+|------------|-----------|
+| `Auto` (default) | Student's own contact if reachable on the channel, otherwise a guardian. |
+| `Student` | Prefer the student's own contact; fall back to a guardian if unreachable. |
+| `Guardian` | Prefer a guardian's contact; fall back to the student if unreachable. |
+
+The preference is **per enrollment**, so each institute controls routing for the same person
+independently — consistent with the multi-tenant model. The resolver reads it via
+`IInstituteContext`; when there is no institute in scope (system-level callers) it defaults to
+`Auto`, preserving prior behaviour. **Reachability always wins**: an unreachable preferred side
+falls through to the other rather than dropping the message, mirroring the PWA enrollment form's
+rule that every student must have at least one reachable destination (own email/mobile or a
+primary guardian with a phone/email).
+
+A student's own **mobile** is optional and stored on `ApplicationUser.PhoneNumber`; it is
+collected on the enrollment form and editable afterwards.
+
+## 2. Current state of the transport (the honest picture)
+
+```mermaid
+graph LR
+    Caller[SendUserNotificationCommand] --> Resolver[StudentContactResolver]
+    Resolver --> Row[(ams_notifications row, status=Pending)]
+    Row -. NOTHING READS THIS .-> Void[ ]
+    Email[SmtpEmailService] -. password reset only .-> SMTP[Gmail SMTP]
+```
+
+- `SendUserNotificationCommand` resolves the contact, then **persists a `Notification` row with
+  `Status = Pending`** (`AMS.Domain/Entities/Notification/Entity/Notification.cs`). The entity
+  already models the full lifecycle — `MarkAsSent`, `MarkAsDelivered`, `MarkAsFailed`,
+  `RetryCount`, `SentAt`, `DeliveredAt`, `ErrorMessage`.
+- **No process ever dispatches those rows.** There is no SMS provider, no dispatch worker, and
+  no DLR handling. Rows accumulate in `Pending` forever.
+- The only real transport is `SmtpEmailService` (Gmail SMTP), used **only** for password-reset
+  and similar identity emails — it is not wired to the `Notification` pipeline.
+- Background workers exist for other concerns (`AMS.Infrastructure/BackgroundServices/` —
+  card expiry, attendance, identity matching) and are the right template for a dispatch worker,
+  but none currently send notifications.
+
+**Conclusion:** the *data model* is close to industry standard; the *delivery layer is absent.*
+
+## 3. Gap analysis vs. industry standard
+
+| Capability | Industry standard | AMS today |
+|---|---|---|
+| Decoupled send (enqueue → dispatch) | Transactional outbox / queue + worker | ❌ row written, never sent |
+| Provider abstraction | `ISender` per channel, swappable | ❌ none (SMTP hard-wired for auth only) |
+| Retries & backoff | Exponential backoff, max attempts, DLQ | ⚠️ `RetryCount` field exists, unused |
+| Delivery receipts (DLR) | Provider webhook → Delivered/Failed | ❌ none |
+| Idempotency | Dedupe key prevents double-send | ❌ none |
+| Consent / opt-out | STOP handling, per-type opt-out | ⚠️ `UserPreference` flags exist, not enforced at send |
+| Quiet hours / rate limits | Defer & throttle per tenant | ❌ none |
+| Templating & i18n | Versioned templates, Sinhala/Tamil/English | ⚠️ `EmailTemplate` entity exists; no SMS templates |
+| Sender identity & deliverability | SPF/DKIM/DMARC; registered SMS mask/sender ID | ⚠️ Gmail SMTP only |
+| Observability | Delivery/failure metrics, alerting | ❌ logs only |
+
+## 4. Recommended target architecture (.NET-native)
+
+```mermaid
+graph TB
+    Cmd[SendUserNotificationCommand] --> Outbox[(ams_notifications = outbox, Pending)]
+    Worker[NotificationDispatchWorker : BackgroundService] --> Outbox
+    Worker --> Router{channel}
+    Router -->|Email| EmailSender[IEmailNotificationSender]
+    Router -->|SMS| SmsSender[ISmsNotificationSender]
+    EmailSender --> EProv[SES / SendGrid / Postmark]
+    SmsSender --> SProv[LK aggregator / Twilio]
+    EProv -. bounce/complaint webhook .-> Hooks[/webhooks/notifications/email/]
+    SProv -. DLR webhook .-> HooksS[/webhooks/notifications/sms/]
+    Hooks --> Outbox
+    HooksS --> Outbox
+```
+
+1. **Transactional outbox.** Keep `ams_notifications` as the outbox; rows are written in the same
+   transaction as the triggering change (already the case). This guarantees "persist then send"
+   with no lost messages.
+2. **`NotificationDispatchWorker`** — a `BackgroundService` (same pattern as the existing
+   workers) that polls `Pending` (`FOR UPDATE SKIP LOCKED` or a claim column to allow scaling),
+   dispatches, and transitions status. Reuse the existing `RetryCount` with exponential backoff
+   and a terminal `Failed`/dead-letter state after N attempts.
+3. **`INotificationSender` per channel.** One interface, a `Sms` and an `Email` implementation.
+   `IEmailService` already provides the email seam; generalise it to send templated content, not
+   just password resets.
+4. **Providers.**
+   - **Email:** move transactional mail to a deliverability-focused provider (Amazon SES,
+     SendGrid, or Postmark) with SPF/DKIM/DMARC on `classpass.lk`, plus bounce/complaint
+     webhooks. Keep SMTP as a dev fallback.
+   - **SMS (Sri Lanka):** local aggregators (e.g. Text.lk / Notify.lk, or direct Dialog/Mobitel/
+     Hutch enterprise SMS) give cheaper local rates and a registered alphanumeric sender mask,
+     but require sender-ID/mask registration and have per-operator quirks. Global providers
+     (Twilio, Vonage) are faster to integrate and offer DLR webhooks out of the box but cost
+     more per message and need sender-ID provisioning for LK. Recommend an aggregator for
+     production volume with a provider interface so Twilio can be a fallback.
+5. **Delivery receipts.** Add `/webhooks/notifications/{sms,email}` endpoints that map
+   provider callbacks to `MarkAsDelivered` / `MarkAsFailed` via a stored provider message id
+   (use `Notification.Metadata`, which already carries `contactSource`).
+6. **Consent, opt-out & quiet hours.** Enforce the existing `UserPreference` notification flags
+   at dispatch time; honour SMS STOP replies; defer non-urgent messages outside quiet hours;
+   apply per-tenant rate limits.
+7. **Templating & i18n.** Extend `EmailTemplate` to cover SMS bodies (160-char awareness) and add
+   Sinhala/Tamil/English variants keyed by recipient/institute locale.
+8. **Observability.** Emit delivery/failure/latency metrics per channel and per tenant; alert on
+   rising failure rates and growing `Pending` backlog.
+
+## 5. Phased rollout
+
+1. **Phase 1 — Email delivery online.** `NotificationDispatchWorker` + generalised
+   `IEmailNotificationSender` on a real provider with retries. Notifications stop dying as
+   `Pending`.
+2. **Phase 2 — SMS + DLR.** Add `ISmsNotificationSender` (LK aggregator), provider message-id
+   capture, and delivery webhooks.
+3. **Phase 3 — Governance.** Enforce consent/opt-out, quiet hours, per-tenant rate limits;
+   add templating + localization.
+4. **Phase 4 — Push / in-app.** Implement the remaining `NotificationChannel` values.
+
+Until Phase 1 ships, treat persisted `Pending` notifications as an audit log only — they are
+**not** being delivered to students or guardians.
+
+---
+
+**Previous:** [Notification Service](./notification-service.md) | **Next:** [User Management](./user-management.md)
 
 
 <div style="page-break-after: always;"></div>
@@ -8149,6 +10760,442 @@ const emailDeliveryCounter = new Counter({
 
 <div style="page-break-after: always;"></div>
 
+# 🧾 Receipt Printing Module
+
+> Thermal receipt printing for fee payments — multi-printer, multi-transport, with fully configurable receipt content
+
+## 1. Module Overview
+
+Some institutes hand the student a **printed receipt** at the moment they pay a class
+fee. The hardware varies widely — desk-mounted WiFi thermal printers (e.g.
+[Xprinter XP-Q838L](https://savefrist.com/product/xp-q838l-3-thermal-receipt-printer-wi-fi/)),
+handheld Bluetooth units with NFC, and USB/serial printers.
+
+This module makes connecting any of them **easy via predefined printer profiles**,
+lets each institute **configure exactly what prints on the receipt**, and reaches the
+hardware through a **tiered transport ladder** that works whether the desk is a Windows
+PC, a Mac, or an Android tablet.
+
+```mermaid
+graph TB
+    subgraph "Receipt Printing Module"
+        Profiles[Printer Profiles<br/>predefined types]
+        Registry[Printer Registry<br/>institute-scoped]
+        Template[Receipt Template<br/>configurable content]
+        Renderer[Receipt Renderer<br/>device-neutral]
+        EscPos[ESC/POS Writer]
+        Html[HTML/PDF Writer]
+        Transport[Transport Tiers]
+    end
+
+    subgraph "Existing AMS"
+        Payment[Payment / RecordPayment]
+        DocSvc[IDocumentService + Blob]
+        Notif[Notification Service]
+        Kiosk[KioskDevice pattern]
+        EmailTpl[EmailTemplate pattern]
+    end
+
+    Payment -->|PaymentRecordedEvent| Renderer
+    Template --> Renderer
+    Profiles --> Registry
+    Registry --> Transport
+    Renderer --> EscPos
+    Renderer --> Html
+    EscPos --> Transport
+    Html --> DocSvc
+    Html --> Transport
+    DocSvc --> Notif
+    Kiosk -.precedent.-> Registry
+    EmailTpl -.precedent.-> Template
+```
+
+## 2. Why this design (industry context)
+
+Thermal printers almost universally speak **ESC/POS** (the Epson POS command standard);
+the XP-Q838L and the cheap Xprinter/handheld units all do. The hard part is **not** the
+command language — it's **where the bytes are produced and how they reach the printer**,
+and the AMS topology constrains that:
+
+- The **backend runs on a VPS**. Institute printers (e.g. `192.168.x.x:9100`) sit
+  **behind NAT on the institute LAN**, so the server **cannot open a raw socket** to them.
+  Naïve "server prints to printer IP" does not work for the common case.
+- The **PWA runs on the desk on the same LAN** as the printer — but **browsers cannot
+  open raw TCP sockets**, so a browser cannot hit port 9100 directly either.
+
+This is precisely why POS SaaS products (Square, Loyverse, Toast) do **not** pick one
+transport — they layer them. AMS does the same: **render content once on the server,
+transport in tiers from the client.**
+
+## 3. Reuse of existing patterns
+
+The module is not greenfield — it slots into established seams:
+
+| Existing thing | Reused for |
+|---|---|
+| `Payment.ReceiptUrl` + `Payment.SetReceiptUrl()` (defined, currently unused) | Persisted PDF/HTML receipt copy |
+| `IDocumentService` + Azure Blob | Store / serve receipt artifacts |
+| `EmailTemplate` (keyed, DB-stored, editable, token body) | Precedent for the **configurable receipt template** |
+| `KioskDevice` (institute-scoped device, label, token hash, active/expiry) | Precedent for the **printer registry / pairing** |
+| `SystemSetting` (key/value/category) | Per-institute toggles (auto-print, default paper width) |
+| Domain events flushed in `ApplicationDbContext.SaveChangesAsync()` + Notification module | Trigger receipt rendering exactly like SMS/email |
+| PWA at the desk (React 19, same LAN as the printer) | Where physical printing happens |
+
+## 4. Data Model
+
+```mermaid
+erDiagram
+    Institute ||--o{ ReceiptPrinter : "registers"
+    Institute ||--o{ ReceiptTemplate : "configures"
+    PrinterProfile ||--o{ ReceiptPrinter : "typed by"
+    Payment ||--o| ReceiptUrl : "produces"
+
+    ReceiptPrinter {
+        guid Id
+        guid InstituteId
+        string Label
+        string ProfileKey
+        enum  ConnectionKind
+        string IpAddress
+        int    Port
+        string BluetoothName
+        string UsbVendorProductId
+        int    PaperWidthMm
+        bool   SupportsCut
+        bool   SupportsDrawer
+        string Codepage
+        bool   IsDefault
+        bool   IsActive
+    }
+
+    PrinterProfile {
+        string ProfileKey
+        string DisplayName
+        int    PaperWidthMm
+        string Codepage
+        bool   SupportsCut
+        bool   SupportsDrawer
+        enum   DefaultConnectionKind
+    }
+
+    ReceiptTemplate {
+        guid   Id
+        guid   InstituteId
+        string Key
+        json   Layout
+        bool   IsActive
+    }
+```
+
+### 4.1 `ReceiptPrinter` — the registry (modeled on `KioskDevice`)
+
+Institute-scoped record of a physical printer. `ProfileKey` ties it to a predefined
+profile so the operator only fills in what that profile actually needs.
+
+`ConnectionKind` drives which transport tier the PWA uses:
+
+```
+BrowserDriver | WebBluetooth | WebUsb | WebSerial | NetworkBridge | CloudPrnt
+```
+
+### 4.2 `PrinterProfile` — predefined types ("easy onboarding")
+
+A **seeded catalog** of known printers. Onboarding becomes "pick your model from a
+dropdown." Supporting a new model = adding a profile row (data), **no code change**.
+
+Seed examples:
+
+| ProfileKey | DisplayName | Paper | Default transport |
+|---|---|---|---|
+| `xprinter-80-wifi` | Xprinter XP-Q838L (WiFi 80mm) | 80mm | `BrowserDriver` (or `NetworkBridge`) |
+| `xprinter-58-bt` | Xprinter handheld (Bluetooth 58mm) | 58mm | `WebBluetooth` |
+| `epson-tm-network` | Epson TM series (Network) | 80mm | `NetworkBridge` / `CloudPrnt` |
+| `generic-escpos-80` | Generic ESC/POS 80mm | 80mm | `BrowserDriver` |
+| `generic-escpos-58` | Generic ESC/POS 58mm | 58mm | `WebBluetooth` |
+| `browser-default` | System default printer | — | `BrowserDriver` |
+
+### 4.3 `ReceiptTemplate` — configurable content (modeled on `EmailTemplate`)
+
+Institute-scoped, keyed (`FeePayment`). Stores a **structured layout** (not raw ESC/POS),
+so the same definition renders to ESC/POS **and** HTML. `Layout` is JSON describing
+ordered, individually-toggleable sections:
+
+- **Header** — logo (`Institute.LogoUrl`), name, address, phone (from `Institute`)
+- **Title / receipt no.** — `ReferenceNumber`
+- **Body fields** — token-substituted lines
+- **Totals** — amount paid, balance/outstanding
+- **Footer** — thank-you message, signature line, QR/barcode of the reference
+
+Supported tokens: `{{InstituteName}} {{StudentName}} {{ClassName}} {{Period}}
+{{Amount}} {{PaymentMethod}} {{Reference}} {{ReceivedBy}} {{Date}} {{Balance}}`.
+
+Per-section `visible` flags = **"configure what writes to the receipt."**
+
+## 5. Rendering Pipeline — render once, target many
+
+The cornerstone is a **device-neutral intermediate representation** so content is defined
+in exactly one place.
+
+```mermaid
+sequenceDiagram
+    participant H as RecordPaymentHandler
+    participant E as PaymentRecordedEvent
+    participant R as IReceiptRenderer
+    participant DOC as ReceiptDocument (neutral)
+    participant ESC as EscPosWriter
+    participant HTML as HtmlReceiptWriter
+    participant BLOB as IDocumentService
+
+    H->>E: raise on SaveChangesAsync
+    E->>R: render(payment, template, institute)
+    R->>DOC: ordered lines/blocks (align, emphasis, qr)
+    DOC->>HTML: HTML/PDF (Tier 0/1)
+    HTML->>BLOB: store -> Payment.SetReceiptUrl()
+    DOC->>ESC: ESC/POS bytes (Tier 2/3, on demand)
+```
+
+- **`IReceiptRenderer`** turns `(Payment + ReceiptTemplate + Institute branding)` into a
+  **`ReceiptDocument`**: an ordered list of blocks (text with alignment/emphasis, a
+  divider, a barcode/QR of the reference number, a cut marker).
+- **`EscPosWriter`** consumes `ReceiptDocument` → ESC/POS byte stream. Pure C#, no external
+  dependency. Handles 58 vs 80mm width, codepage, auto-cut, optional cash-drawer kick.
+- **`HtmlReceiptWriter`** consumes the same `ReceiptDocument` → an 80mm/58mm CSS receipt
+  page used both for `window.print()` and for the stored PDF/HTML blob copy.
+
+## 6. Transport Tiers (the fallback ladder)
+
+A printer's `ConnectionKind` selects the tier automatically in the PWA. All four tiers
+ship (per decision: "need all three tiers" + mixed desktop/mobile environment).
+
+```mermaid
+graph LR
+    T0[Tier 0<br/>Blob receipt + email/SMS<br/>zero hardware]
+    T1[Tier 1 - BrowserDriver<br/>window.print HTML<br/>any OS driver incl. WiFi]
+    T2[Tier 2 - WebBluetooth/USB/Serial<br/>raw ESC/POS from browser<br/>handhelds + USB desk]
+    T3[Tier 3 - NetworkBridge / CloudPRNT<br/>driverless network ESC/POS]
+    T0 --> T1 --> T2 --> T3
+```
+
+- **Tier 0 — always on, no hardware.** Server renders HTML/PDF, stores via
+  `IDocumentService`, sets `Payment.ReceiptUrl`. Permanent record + reprint +
+  **emailable/SMS receipt** over existing notification rails. Works with zero printers
+  configured.
+- **Tier 1 — `BrowserDriver` (default for desk PCs).** PWA loads the rendered receipt HTML
+  and calls `window.print()`. Works with **any OS-installed driver**, including the
+  XP-Q838L over WiFi — because the **OS driver** handles the TCP, not the browser. Most
+  compatible, least code. The printer ships with Windows/Mac drivers; install once, set as
+  default, done.
+- **Tier 2 — `WebBluetooth` / `WebUsb` / `WebSerial` (full control + handhelds).** PWA
+  fetches ESC/POS bytes from `GET /api/payments/{id}/receipt?format=escpos` and pushes them
+  directly. Web Bluetooth → handheld BT printers (no driver). WebUSB/WebSerial → USB/serial
+  desk printers. Enables precise cut and cash-drawer control. *Chromium-based browsers; not
+  iOS Safari.*
+- **Tier 3 — `NetworkBridge` / `CloudPrnt` (driverless network ESC/POS).** For a network
+  printer with no OS driver: a tiny optional **local bridge agent** on the desk listens on
+  `localhost` and forwards bytes to `printerIP:9100`; the PWA POSTs ESC/POS to it.
+  Alternatively **CloudPRNT**, where a capable printer (e.g. Star) polls an AMS endpoint for
+  queued jobs — no inbound reach to the LAN required.
+
+### 6.1 Environment → recommended tier
+
+| Desk environment | Network/WiFi printer | Handheld BT | USB desk |
+|---|---|---|---|
+| Windows / Mac PC | Tier 1 (driver) → Tier 3 if driverless | Tier 2 (Web BT) | Tier 1 or Tier 2 |
+| Android tablet/phone | Tier 3 bridge / CloudPRNT | **Tier 2 (Web BT)** | Tier 2 (WebUSB) |
+| iOS (Safari) | Tier 1 (AirPrint driver) / Tier 0 email | Tier 0 (no Web BT) | Tier 0 |
+
+> Tier 0 is the universal safety net — if no live transport succeeds, the student still
+> gets an emailed/SMS receipt and staff can reprint from the stored copy.
+
+## 7. Trigger Flow (print-on-payment)
+
+`RecordPaymentCommandHandler` already flushes domain events in `SaveChangesAsync()`. Add:
+
+1. **`PaymentRecordedDomainEvent`** raised by `Payment.Create`.
+2. **Handler** renders Tier 0 (blob + `SetReceiptUrl`) asynchronously; optionally fires the
+   email/SMS receipt notification.
+3. **PWA**: after a successful `POST /api/payments`, the `record-payment-form` auto-runs the
+   institute's **default printer** via its configured transport (Tier 1/2/3). A **Reprint**
+   button on `payment-detail` re-runs the same path on demand.
+
+## 8. Onboarding & Configuration UX (PWA)
+
+Two new screens under existing **Settings**:
+
+- **Receipt Printers** — `Add printer → pick predefined profile (dropdown incl. "XP-Q838L
+  (WiFi 80mm)") → fill only the fields that profile needs (IP, or "Pair Bluetooth", or "Use
+  system printer") → Test print`. Mark one **default** per institute.
+- **Receipt Template** — mirrors the email-template editor: edit header/body/footer,
+  toggle sections, live preview, token palette.
+
+## 9. API Surface (additions)
+
+| Method | Route | Purpose | Permission |
+|---|---|---|---|
+| `GET` | `/api/printer-profiles` | List predefined profiles | `payments:view` |
+| `GET/POST/PUT/DELETE` | `/api/receipt-printers` | Manage institute printers | `settings:manage` |
+| `POST` | `/api/receipt-printers/{id}/test` | Test print | `settings:manage` |
+| `GET/PUT` | `/api/receipt-templates/{key}` | Get/update template | `settings:manage` |
+| `GET` | `/api/payments/{id}/receipt?format=html\|pdf\|escpos` | Fetch rendered receipt | `payments:view` |
+
+## 10. Phased Delivery
+
+1. **Phase 1 — Foundation (no hardware):** `ReceiptTemplate` entity + editor,
+   `IReceiptRenderer` + `HtmlReceiptWriter`, `PaymentRecordedDomainEvent`, Tier-0 blob
+   receipt + `ReceiptUrl`, reprint + email/SMS receipt. *Delivers value immediately.*
+2. **Phase 2 — Default printing:** PWA `window.print()` auto-print; `ReceiptPrinter`
+   registry + `PrinterProfile` seed; `BrowserDriver` printers.
+3. **Phase 3 — ESC/POS:** `EscPosWriter`, Web Bluetooth (handhelds) + WebUSB/WebSerial;
+   expand profile catalog; cut/drawer control.
+4. **Phase 4 — Driverless network:** local bridge agent and/or CloudPRNT polling.
+
+## 11. Open Questions
+
+- Handheld units "with NFC" — is the NFC used to **identify the student at the printer**
+  (a card-reader scenario, overlapping the NFC card module), or incidental? Affects whether
+  the printer device also acts as a kiosk reader.
+- Receipt numbering: reuse `Payment.ReferenceNumber` (`PAY-yyyyMMdd-XXXXXXXX`) or introduce
+  a gapless, per-institute sequential receipt number (often a fiscal/audit requirement)?
+- Does any target market require fiscal/tax-compliant receipts (sequential numbering, VAT
+  lines, signed archives)? If so it tightens the template and numbering rules.
+- Local bridge agent (Tier 3): build/distribute in-house, or adopt an existing open-source
+  print-bridge?
+
+
+<div style="page-break-after: always;"></div>
+
+# 💳 SMS Credit Billing Module
+
+> Prepaid, per-institute SMS wallets: institutes fund their own SMS notification costs by bank
+> transfer; the platform verifies the transfer, credits the wallet, and debits it per SMS segment.
+
+## 1. Why this exists
+
+SMS costs real money and there is only **one** gateway account for the whole platform (SMSlenz).
+Without billing, every institute's notification traffic lands on the ClassPass bill. This module
+moves that cost to the institutes without giving them gateway credentials:
+
+| Concern | Owner | Mechanism |
+|---|---|---|
+| Funding | Institute admin | Transfers a **fixed amount** (e.g. LKR 500/1000/2000/3000/5000) to the ClassPass bank account and uploads the deposit receipt |
+| Verification | SystemAdmin | Matches the receipt against the bank statement, then approves (credits the wallet) or rejects with a reason |
+| Charging | Platform (dispatch worker) | Debits `rate × segments` per SMS at send time; refunds automatically if the gateway rejects the message |
+| Pricing | SystemAdmin | Sets the per-segment rate, the allowed top-up amounts, the bank details text, and the enforcement switch in the portal |
+
+Fixed top-up amounts are deliberate: the verifier only ever needs to find an exact 500/1000/…
+credit on the statement, which keeps manual verification fast and unambiguous.
+
+## 2. Data model
+
+Three tables (plus reuse of Documents for receipts):
+
+- **`ams_sms_credit_wallets`** — one row per institute, current `balance`. Created lazily on the
+  first credit.
+- **`ams_sms_credit_topups`** — top-up requests: amount, receipt document id, bank reference,
+  status (`PendingVerification → Approved | Rejected | Cancelled`), reviewer + reason.
+- **`ams_sms_credit_transactions`** — append-only ledger. `amount` is signed (top-up/refund/up
+  adjustment positive; SMS charge/down adjustment negative) and every row snapshots
+  `balance_after`, plus `rate_per_segment` and `segments` on charges so rate changes never
+  rewrite history.
+
+Receipts are uploaded through the existing Documents module (`DocumentCategory.SmsCreditReceipt`)
+into the institute's **private** blob container and viewed via the authenticated
+`/api/documents/{id}/content` proxy (SystemAdmins can read cross-tenant via `access-any`).
+
+## 3. Top-up lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> PendingVerification: Institute admin submits amount + receipt
+    PendingVerification --> Approved: SystemAdmin verifies transfer (wallet credited)
+    PendingVerification --> Rejected: No matching transfer (reason recorded)
+    PendingVerification --> Cancelled: Institute admin withdraws
+```
+
+Approval is **concurrency-safe**: the status flip is a single guarded SQL update
+(`… WHERE status = 'PendingVerification'`) inside one DB transaction with the wallet credit and
+the ledger entry — two admins clicking Approve at once can never double-credit.
+
+## 4. Charging at dispatch time
+
+`NotificationDispatchWorker` consults `ISmsCreditBillingService.TryChargeAsync` right before
+handing an SMS to the gateway:
+
+1. **Segments** are computed by `SmsSegmentCalculator` (GSM-7: 160 single / 153 concatenated;
+   unicode — i.e. Sinhala/Tamil text — 70 / 67). The charge is `ratePerSegment × segments`.
+2. The debit is a single guarded `UPDATE … SET balance = balance - cost WHERE balance >= cost`,
+   so concurrent dispatch ticks cannot overdraw a wallet.
+3. **Insufficient balance** → the notification is marked `Failed` with a clear
+   "Insufficient SMS credit" reason and re-enters the normal retry path, so it still goes out if
+   the institute tops up within the retry window.
+4. **Gateway rejection after a charge** → the amount is refunded immediately with a `Refund`
+   ledger entry.
+
+Pass-through (no charge): platform notifications without an institute, all email, and all
+traffic while **enforcement is disabled**.
+
+## 5. Platform settings
+
+Stored as `SystemSetting` rows (category `SmsCredits`), editable in the portal at
+**Platform → SMS Billing → Billing Settings**:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `sms-credits.rate-per-segment` | LKR charged per segment | `0` (free) |
+| `sms-credits.topup-amounts` | Comma-separated fixed amounts | `500,1000,2000,3000,5000` |
+| `sms-credits.bank-details` | Transfer instructions shown to institutes | empty |
+| `sms-credits.enforcement-enabled` | Hard prepaid gate on/off | `false` |
+| `sms-credits.low-balance-threshold` | PWA warning threshold | `200` |
+
+**Rollout is a deliberate two-step act**: defaults are rate 0 + enforcement off, so nothing
+changes for existing institutes until a SystemAdmin sets a rate *and* flips enforcement on
+(after institutes have had a window to fund their wallets).
+
+## 6. Permissions
+
+| Permission | Who | Grants |
+|---|---|---|
+| `sms-credits:view` | Institute Admin (seeded) | Balance, own top-ups, usage ledger |
+| `sms-credits:topup` | Institute Admin (seeded) | Submit / cancel top-up requests |
+| `sms-credits:manage` | SystemAdmin only | Verification queue, approve/reject, adjustments, wallets overview, billing settings |
+
+`sms-credits:manage` is a **system permission**: excluded from the tenant Admin role and listed
+in `InstitutePermissionPolicy.AlwaysIneligibleNames`, so it can never be made
+institute-assignable. `view`/`topup` are institute-assignable (resource is in the eligibility
+ceiling) and part of the seeded institute **Admin** role.
+
+## 7. API surface
+
+Institute (`/api/sms-credits`, tenant context required):
+`GET summary` · `GET transactions` (paged) · `GET top-ups` · `POST top-ups` (multipart: receipt +
+amount + bankReference + note) · `POST top-ups/{id}/cancel`
+
+Platform (`/api/admin/sms-credits`, `sms-credits:manage`):
+`GET top-ups?status=` · `POST top-ups/{id}/approve` · `POST top-ups/{id}/reject` ·
+`GET wallets` · `POST adjustments` · `GET/PUT settings`
+
+## 8. PWA surfaces
+
+- **Institute → SMS Credits** (`/sms-credits`): balance / rate / est.-SMS-remaining cards,
+  low-balance warning, top-up dialog (fixed amounts + bank details + receipt upload), top-up
+  history with statuses and rejection reasons, paged usage ledger.
+- **Platform → SMS Billing** (`/admin/sms-credits`, root host only): verification queue with
+  receipt preview and approve/reject, wallets overview with manual adjustments, billing
+  settings editor.
+
+## 9. Known gaps / future work
+
+- **Low-balance notification**: the PWA warns on the dashboard, but no proactive email/SMS is
+  sent to institute admins when the balance crosses the threshold.
+- **Crash window**: if the worker dies between wallet debit and the notification's `Sent` state
+  persisting, the row is retried and charged again (mirrors the pre-existing double-send
+  window). The ledger keeps both charges visible for manual adjustment.
+- **No per-institute rate override** — the rate is platform-wide.
+- **Email is unmetered** — only SMS is billed (email cost is negligible today).
+
+
+<div style="page-break-after: always;"></div>
+
 # 👤 User Management Module
 
 > User registration, authentication, and role management for AMS
@@ -8627,10 +11674,6 @@ graph TB
 ---
 
 **Previous:** [Security Architecture](../architecture/security-architecture.md) | **Next:** [Institute Management](./institute-management.md)
-
-
-
-<div style="page-break-after: always;"></div>
 
 
 

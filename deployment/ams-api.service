@@ -8,10 +8,34 @@ ExecStart=/usr/bin/dotnet /var/www/ams-api/AMS.Api.dll
 Restart=always
 RestartSec=10
 SyslogIdentifier=ams-api
-User=ubuntu
+
+# Run as a dedicated, non-login service account rather than the broad `ubuntu`
+# sudoer (SEC-14). Create once with:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin ams
+#   sudo chown -R ams:ams /var/www/ams-api /var/log/ams
+User=ams
+Group=ams
+
 Environment=ASPNETCORE_ENVIRONMENT=Production
 Environment=ASPNETCORE_URLS=http://localhost:5000
 EnvironmentFile=/etc/ams/api.env
+
+# --- Sandboxing (SEC-14) ---
+# A process compromise should not be able to escalate or roam the host.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+# ProtectSystem=strict makes the whole filesystem read-only except these paths.
+# The API only needs to write its rolling logs.
+ReadWritePaths=/var/log/ams
 
 [Install]
 WantedBy=multi-user.target
