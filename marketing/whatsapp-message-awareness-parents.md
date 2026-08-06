@@ -37,24 +37,21 @@ To make your child's education more transparent and convenient, we are planning 
 
 ━━━━━━━━━━━━━━━
 
-✨ *What ClassPass brings you*
+✨ *What ClassPass brings you as a parent*
 
 🪪 Your child receives a personal *QR ID card*
+
 ✅ Attendance is marked *instantly with one scan* at the classroom
-📲 You get an *SMS the moment your child arrives** at class
-💰 Every fee you pay is confirmed by *SMS** and a *printed receipt*
-📱 View your child's attendance & payment records *anytime online*
+
+📲 Know *the moment your child arrives safely* at class via *SMS**
+
+💰 Every fee you pay is confirmed by *SMS** and a *printed receipt* — full transparency
+
+📱 View attendance & payment records *anytime online* — always up to date and accurate
+
+🔒 Your child's records are kept *private and secure*
 
 _* Activating the SMS feature carries an annual charge (see below)_
-
-━━━━━━━━━━━━━━━
-
-👨‍👩‍👧 *As a parent, you benefit from*
-
-🗓️ Knowing *instantly* that your child arrived at class safely
-🔍 Checking every fee payment clearly — *full transparency*
-🔒 Your child's records kept *private and secure*
-⏱️ Attendance & payment records updated *quickly and accurately*
 
 ━━━━━━━━━━━━━━━
 
@@ -88,24 +85,21 @@ Thank you!
 
 ━━━━━━━━━━━━━━━
 
-✨ *ClassPass මගින් ඔබට ලැබෙන ප්‍රතිලාභ*
+✨ *ClassPass මගින් දෙමාපිය ඔබට ලැබෙන ප්‍රතිලාභ*
 
 🪪 ඔබේ දරුවාට තමන්ගේම *QR ID කාඩ්පතක්* ලැබේ
+
 ✅ පන්තියට පැමිණෙන විට කාඩ්පත *scan කිරීමෙන් ක්ෂණිකව* පැමිණීම සටහන් වේ
-📲 දරුවා පන්තියට *පැමිණි විගසම ඔබට SMS** පණිවිඩයක් ලැබේ
-💰 ඔබ ගෙවන සෑම ගාස්තුවක්ම *SMS** සහ *මුද්‍රිත රිසිට්පතකින්* තහවුරු වේ
-📱 දරුවාගේ පැමිණීම් සහ ගෙවීම් විස්තර ඔබටම *ඕනෑම වේලාවක Online* බලාගත හැක
+
+📲 දරුවා පන්තියට *ආරක්ෂිතව පැමිණි බව* එසැණින් *SMS** මගින් දැනගත හැක
+
+💰 ඔබ ගෙවන සෑම ගාස්තුවක්ම *SMS** සහ *මුද්‍රිත රිසිට්පතකින්* තහවුරු වේ — සම්පූර්ණ විනිවිදභාවයක්
+
+📱 පැමිණීම් සහ ගෙවීම් විස්තර *ඕනෑම වේලාවක Online* බලාගත හැක — සැමවිටම ඉක්මනින් හා නිවැරදිව යාවත්කාලීන වේ
+
+🔒 දරුවාගේ සියලු තොරතුරු *ආරක්ෂිතව කළමනාකරණය* කෙරේ
 
 _* SMS පහසුකම සක්‍රීය කිරීම සඳහා වාර්ෂික ගාස්තුවක් අදාළ වේ (පහත බලන්න)_
-
-━━━━━━━━━━━━━━━
-
-👨‍👩‍👧 *දෙමාපියෙකු ලෙස ඔබට ලැබෙන වාසි*
-
-🗓️ දරුවා පන්තියට ආරක්ෂිතව පැමිණි බව *එසැණින් දැනගත හැක*
-🔍 ඔබ ගෙවූ සියලු ගාස්තු *පැහැදිලිව පරීක්ෂා කළ හැක* — සම්පූර්ණ විනිවිදභාවයක්
-🔒 දරුවාගේ තොරතුරු *ආරක්ෂිතව කළමනාකරණය* කෙරේ
-⏱️ පැමිණීම් සහ ගෙවීම් තොරතුරු *ඉක්මනින් හා නිවැරදිව* යාවත්කාලීන වේ
 
 ━━━━━━━━━━━━━━━
 
@@ -137,9 +131,11 @@ _* SMS පහසුකම සක්‍රීය කිරීම සඳහා ව
   | Institute preparing parents *before* implementation | this file |
   | System live — onboarding students & parents | [whatsapp-message-students-parents](./whatsapp-message-students-parents.md) |
 - **Parent-directed framing**: every benefit line speaks to the parent ("your
-  child", "you get an SMS", "every fee you pay"), and the middle section is
-  framed as what the parent gains rather than why the institute is adopting
-  the system.
+  child", "you get an SMS", "every fee you pay"). Benefits are consolidated
+  into a single section — the "why we are doing this" arguments (instant
+  arrival awareness, fee transparency, accurate records, privacy) are folded
+  into the matching benefit lines, with blank lines between benefits to keep
+  the longer section scannable on a phone.
 - **Fee disclosure**: two charges are listed together under one fee section —
   the one-time Rs. 150/= card and the optional Rs. 250/= annual SMS
   activation. The SMS-dependent benefit lines carry a `**` footnote marker so
